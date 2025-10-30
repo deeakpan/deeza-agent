@@ -22,28 +22,14 @@ Bot: [Remembers previous conversation]
      "Sending 6 STT to @david..."
 ```
 
-### 3. **Dynamic Contract Registry**
-Add ANY contract to Supabase and users can interact with it!
-
-```sql
--- Add NFT Marketplace
-INSERT INTO contracts VALUES ('0x123...', 'NFTMarket', 'NFT Marketplace');
-INSERT INTO contract_functions VALUES (
-  'buy',
-  'buy(uint256,uint256)',
-  'tokenId', 'uint256', 'NFT ID to buy',
-  'quantity', 'uint256', 'How many to buy'
-);
+### 3. **Token Intelligence (Conversational)**
+Ask natural questions about tokens and get direct answers:
 ```
+User: "What's SOMI 24h volume?"
+Bot: "SOMI has traded $145K in the last 24 hours."
 
-```
-User: "buy from NFTMarket"
-Bot: "To buy from NFTMarket, I need: tokenId (NFT ID) and quantity. 
-     Example: buy 1, 2"
-
-User: "buy 1, 2"
-Bot: "Buying NFT #1 (quantity: 2) from NFTMarket..."
-     [Executes: NFTMarket.buy(1, 2)]
+User: "Compare SOMI and PEPE market cap"
+Bot: "SOMI: $2.4M | PEPE: $1.8M — SOMI is ~33% larger."
 ```
 
 ### 4. **Token Existence Validation**
@@ -119,17 +105,12 @@ conversation_context
 8. Bot clears context
 ```
 
-### Contract Registry Flow
+### Token Query Flow
 ```
-1. User: "buy from NFTMarket"
-2. Bot queries Supabase:
-   SELECT * FROM contracts WHERE contract_name = 'NFTMarket'
-3. Bot finds contract + functions
-4. Bot sees buy() needs: tokenId, quantity
-5. Bot responds: "To buy, I need tokenId and quantity"
-6. User: "buy 1, 2"
-7. Bot parses params: [1, 2]
-8. Bot executes: NFTMarket.buy(1, 2)
+1. User: "SOMI price?"
+2. Bot searches GeckoTerminal for SOMI on Somnia
+3. Bot fetches pool market data (price, volume, liquidity)
+4. Bot replies conversationally with the requested metric
 ```
 
 ## 🔧 Setup
@@ -155,52 +136,8 @@ ENCRYPTION_KEY=your_32_char_key
 node deezabot-v2.js
 ```
 
-## 📝 Adding New Contracts
-
-### Example: DEX Swap
-
-```sql
--- Add DEX contract
-INSERT INTO contracts (contract_address, contract_name, description) 
-VALUES ('0xDEX123...', 'DEXSwap', 'Decentralized exchange for token swaps');
-
--- Add swap function
-INSERT INTO contract_functions (
-  contract_id,
-  function_name,
-  function_signature,
-  description,
-  param1_name, param1_type, param1_description,
-  param2_name, param2_type, param2_description,
-  param3_name, param3_type, param3_description,
-  is_payable
-) 
-SELECT 
-  id,
-  'swap',
-  'swap(address,address,uint256)',
-  'Swap tokens on DEX',
-  'tokenIn', 'address', 'Token to swap from',
-  'tokenOut', 'address', 'Token to swap to',
-  'amount', 'uint256', 'Amount to swap',
-  false
-FROM contracts WHERE contract_name = 'DEXSwap';
-```
-
-Now users can:
-```
-User: "swap on DEXSwap"
-Bot: "To swap on DEXSwap, I need:
-     • tokenIn (Token to swap from)
-     • tokenOut (Token to swap to)  
-     • amount (Amount to swap)
-     
-     Example: swap 0xSTT..., 0xUSDC..., 100"
-
-User: "swap 0xSTT..., 0xUSDC..., 100"
-Bot: "Swapping on DEXSwap..."
-     [Executes: DEXSwap.swap(0xSTT..., 0xUSDC..., 100)]
-```
+## 🧠 Token Intelligence Setup
+No contract registry. The bot uses GeckoTerminal + on-chain reads to answer token questions.
 
 ## 💡 Example Conversations
 
@@ -221,23 +158,12 @@ Bot: Sending 50 STT to @alice...
      Sent! 50 STT → @alice
 ```
 
-### Multi-Step Contract
-```
-User: I want to buy an NFT
-Bot: Which marketplace? Available: NFTMarket, OpenSeaClone
 
-User: NFTMarket
-Bot: To buy from NFTMarket, I need tokenId and quantity
-
-User: buy 5, 1
-Bot: Buying NFT #5 (quantity: 1) from NFTMarket...
-     buy executed on NFTMarket!
-```
 
 ### Token Validation
 ```
 User: check balance of 0xFakeToken123
-Bot: That token doesn't exist on Shannon Testnet!
+Bot: That token doesn't exist on Somnia!
      Want to check a different address?
 
 User: yes, check 0xUSDC...
@@ -253,7 +179,7 @@ Bot: USD Coin (USDC)
 ✅ Balance checks before transactions
 ✅ Token existence validation
 ✅ Gas balance verification
-✅ Contract registry prevents arbitrary calls
+
 
 ## 🚀 Advanced Features
 
@@ -265,8 +191,7 @@ Bot: USD Coin (USDC)
 - Liquidity provision
 - Cross-chain bridging
 
-### Extensibility
-The contract registry makes it easy to add ANY smart contract interaction without changing bot code!
+
 
 ## 📚 API Reference
 
@@ -288,19 +213,15 @@ const tokenAmount = await convertUSDToToken(10, 'STT');
 // Returns: 434.78 (for STT at $0.023)
 ```
 
-### Contract Calls
-```javascript
-const contract = await getContractByName('NFTMarket');
-// Returns: { contract_address, functions: [...] }
-```
+
 
 ## 🎯 Next Steps
 
-1. Add more contracts to registry
-2. Implement token approvals
-3. Add multi-sig support
-4. Create admin panel for contract management
-5. Add transaction history tracking
+1. Improve token symbol resolution
+2. Add chart screenshots for token queries
+3. Add watchlists and alerts
+4. Add recent transactions view
+5. Support more timeframes and comparisons
 
 ---
 
