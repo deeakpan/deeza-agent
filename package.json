@@ -1,0 +1,36 @@
+{
+  "name": "deeza-agent",
+  "version": "1.0.0",
+  "main": "deezabot.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node deezabot.js",
+    "dev": "nodemon deezabot.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "@supabase/supabase-js": "^2.76.1",
+    "@types/node-telegram-bot-api": "^0.64.11",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.28.0",
+    "ts-node": "^10.9.2"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.1.0",
+    "@nomiclabs/hardhat-etherscan": "^3.1.8",
+    "@types/node": "^22.18.12",
+    "forge-std": "github:foundry-rs/forge-std#v1.9.4",
+    "hardhat": "^2.26.3",
+    "nodemon": "^3.0.3",
+    "typescript": "~5.8.0",
+    "viem": "^2.38.4"
+  }
+}
