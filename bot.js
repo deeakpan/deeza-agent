@@ -17,13 +17,21 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Network Config - MAINNET ONLY
 const SOMNIA_RPC = process.env.SOMNIA_RPC || 'https://somnia.publicnode.com';
 const SOMNIA_EXPLORER = 'https://explorer.somnia.network/';
-// Create provider - suppress network detection warnings by using explicit network
+const SOMNIA_CHAIN_ID = parseInt(process.env.SOMNIA_CHAIN_ID || '50311'); // Somnia mainnet is 50311
+
+// Log RPC being used (but don't expose sensitive URLs)
+console.log('Using RPC:', SOMNIA_RPC.includes('publicnode') ? 'somnia.publicnode.com (mainnet)' : SOMNIA_RPC.replace(/https?:\/\//, '').split('/')[0], '| Chain ID:', SOMNIA_CHAIN_ID);
+
+// Create provider - force network to prevent auto-detection
 const provider = new ethers.JsonRpcProvider(SOMNIA_RPC, {
-  chainId: parseInt(process.env.SOMNIA_CHAIN_ID || '5031'),
+  chainId: SOMNIA_CHAIN_ID,
   name: 'somnia'
 });
-// Override _detectNetwork to prevent retries (hack but works)
-provider._detectNetwork = async () => ({ chainId: parseInt(process.env.SOMNIA_CHAIN_ID || '5031'), name: 'somnia' });
+
+// Completely disable network detection to prevent retries and testnet fallbacks
+provider._detectNetwork = async () => {
+  return { chainId: SOMNIA_CHAIN_ID, name: 'somnia' };
+};
 
 // Router and WETH (WSOMI) for swaps
 const ROUTER_ADDRESS = '0xCdE9aFDca1AdAb5b5C6E4F9e16c9802C88Dc7e1A'; // SomniExchangerRouter02
@@ -220,9 +228,39 @@ Data: ${JSON.stringify(existingContext.context_data)}
 If user provides a number/amount or clarification, complete the pending action!
 ` : '';
 
-    const systemPrompt = `You are Deeza — a chill, conversational, helpful "crypto bro." You help users with swaps, prices, limit orders, and sticking together in the crypto trenches. Your signature emoji is 😉. Use 😉 intentionally for confirmations or when you're being supportive. Sometimes, when users make cool moves (like a token send), react with 😁 in Telegram. Your vibe: "we trenches bro, stick together." Help with token sends, limit orders, comparisons, and wallet info. Keep it real, minimal emojis, and always conversational.
+    const systemPrompt = `You are Deeza — a chill, conversational, helpful "crypto bro." You help users with swaps, prices, market data, and sticking together in the crypto trenches. Your signature emoji is 😉. Use 😉 intentionally for confirmations or when you're being supportive. Sometimes, when users make cool moves (like a token send), react with 😁 in Telegram. Your vibe: "we trenches bro, stick together." Keep it real, minimal emojis, and always conversational.
 
 ALWAYS return a single JSON response with keys: action, params, message. DO NOT output just plain text or any extra description. ONLY produce a single JSON object, nothing else.
+
+CAPABILITIES & ACTIONS:
+1. TOKEN INFORMATION QUERIES - Use these for ANY token-related questions:
+   - "fetch_price" or "fetchPrice" → When user asks for price (e.g., "what's SOMI price?", "price of PEPE")
+   - "fetch_marketcap" or "fetch_market_cap" or "fetchMarketcap" → When user asks for market cap (e.g., "jellu market cap", "what's the mcap of NIA")
+   - "fetch_volume" or "fetchVolume" → When user asks for volume (e.g., "24h volume of SOMI", "volume on PEPE")
+   - "fetch_liquidity" or "fetchLiquidity" → When user asks about liquidity
+   - "fetch_change" or "fetchChange" → When user asks about price change (e.g., "how much did PEPE change?", "24h change SOMI")
+   - "token_info" or "tokenInfo" → When user wants general info about a token (e.g., "tell me about SOMI", "info on PEPE", "show me jellu")
+   
+   All token queries use params: { "token": "SYMBOL" } or { "query": "SYMBOL" } (symbol is the token ticker like "SOMI", "PEPE", "JELLU")
+
+2. WALLET ACTIONS:
+   - "wallet_info" → When user asks about their wallet (e.g., "what's my wallet?", "my address", "show my balance")
+   - "send_token" → When user wants to send tokens (e.g., "send 5 SOMI to 0x...", "send 10 USDC to @user")
+   - "send_usd" → When user wants to send USD value (e.g., "send $5 worth of SOMI")
+   - "balance_check" → When user checks balance of a specific token
+
+3. SWAPS:
+   - "swap_eth_to_token" → When user wants to swap SOMI for another token (e.g., "swap 1 SOMI to PEPE", "swap 0.5 usd somnia to xyz")
+
+4. GENERAL CHAT:
+   - "chat" → For general conversation that doesn't require actions
+
+EXAMPLES:
+User: "what's jellu price?" → {"action":"fetch_price","params":{"token":"jellu"},"message":"Checking JELLU price..."}
+User: "jellu market cap" → {"action":"fetch_marketcap","params":{"token":"jellu"},"message":"Fetching JELLU market cap..."}
+User: "what's the 24h volume on SOMI?" → {"action":"fetch_volume","params":{"token":"SOMI"},"message":"Getting SOMI volume..."}
+User: "show me info on PEPE" → {"action":"token_info","params":{"token":"PEPE"},"message":"Fetching PEPE info..."}
+User: "what's my wallet address?" → {"action":"wallet_info","params":{},"message":"Let me check your wallet..."}
 
 RESPONSE FORMAT (JSON):
 {

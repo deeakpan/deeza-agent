@@ -33,7 +33,7 @@ export async function searchToken(query) {
             .map(p => ({ id: p.id, liq: parseFloat(p.attributes?.reserve_in_usd || '0') }))
             .sort((a, b) => b.liq - a.liq)[0];
           if (best && best.id) {
-            // Pool ID comes as "somnia_0x..." but API needs just "0x..."
+            // Store both: stripped for API calls, full for URLs
             poolAddress = best.id.includes('_') ? best.id.split('_')[1] : best.id;
             liquidity = best.liq;
             console.log('Selected pool:', poolAddress, '(original:', best.id, ')');
@@ -43,10 +43,18 @@ export async function searchToken(query) {
         console.error('Error fetching pools:', err.message);
       }
       
-      // Check token endpoint for FDV (market cap)
+      // Check token endpoint for FDV or market cap (GeckoTerminal provides both)
       if (tokenResp?.data?.attributes?.fdv_usd) {
         fdv_usd = parseFloat(tokenResp.data.attributes.fdv_usd);
         console.log('Found FDV from token endpoint:', fdv_usd);
+      } else if (tokenResp?.data?.attributes?.market_cap_usd) {
+        fdv_usd = parseFloat(tokenResp.data.attributes.market_cap_usd);
+        console.log('Found market_cap_usd from token endpoint:', fdv_usd);
+      }
+      
+      // Debug: Log all available attributes to see what we have
+      if (!fdv_usd && tokenResp?.data?.attributes) {
+        console.log('Available token attributes:', Object.keys(tokenResp.data.attributes).filter(k => k.toLowerCase().includes('cap') || k.toLowerCase().includes('fdv')));
       }
 
       if (tokenSymbol) {
@@ -80,12 +88,30 @@ export async function searchToken(query) {
     // Pool ID comes as "somnia_0x..." but API needs just "0x..."
     const poolId = bestPool.id.includes('_') ? bestPool.id.split('_')[1] : bestPool.id;
     
+    // Try to get FDV from token endpoint if we have the address
+    let fdv_usd = 0;
+    if (tokenAddress && tokenAddress.startsWith('0x')) {
+      try {
+        const tokenResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${tokenAddress}`).then(r => r.json());
+        if (tokenResp?.data?.attributes?.fdv_usd) {
+          fdv_usd = parseFloat(tokenResp.data.attributes.fdv_usd);
+          console.log('Found FDV from token endpoint (symbol search):', fdv_usd);
+        } else if (tokenResp?.data?.attributes?.market_cap_usd) {
+          fdv_usd = parseFloat(tokenResp.data.attributes.market_cap_usd);
+          console.log('Found market_cap_usd from token endpoint (symbol search):', fdv_usd);
+        }
+      } catch (e) {
+        console.error('Error fetching token data for FDV:', e.message);
+      }
+    }
+    
     return {
       tokenAddress,
       tokenSymbol: baseToken.symbol || query,
       tokenName: baseToken.name || 'Unknown Token',
       poolAddress: poolId,
-      liquidity: parseFloat(bestPool.attributes?.reserve_in_usd) || 0
+      liquidity: parseFloat(bestPool.attributes?.reserve_in_usd) || 0,
+      fdv_usd
     };
   } catch (error) {
     console.error('Search token error:', error);
@@ -269,6 +295,14 @@ export async function handleTokenQuery(params, provider) {
  * Format metric response based on user query
  */
 function formatMetricResponse(token, searchResult, marketData, onChainData, metric, timeframe = '24h') {
+  // Helper to add pool link if available
+  const addPoolLink = (msg) => {
+    if (searchResult.poolAddress) {
+      const poolUrl = getChartUrl(searchResult.poolAddress);
+      return msg + `\n\n🔗 Pool & Chart: ${poolUrl}`;
+    }
+    return msg;
+  };
   const timeframeMap = {
     '1h': '1 hour',
     '6h': '6 hours',
@@ -285,12 +319,12 @@ function formatMetricResponse(token, searchResult, marketData, onChainData, metr
   
   switch (metric) {
     case 'price':
-      return `💰 Hey! ${token} is sitting at $${marketData.price.toFixed(6)} right now! 📈`;
+      return addPoolLink(`💰 Hey! ${token} is sitting at $${marketData.price.toFixed(6)} right now! 📈`);
       
     case 'volume':
       const volume = marketData[`volume${timeframe}`] || marketData.volume24h || 0;
       const volFormatted = formatNumber(volume);
-      return `📊 ${token} did $${volFormatted} in ${timeframeLabel} volume - ${volume > 100000 ? 'that\'s solid! 🚀' : 'not bad! 👍'}`;
+      return addPoolLink(`📊 ${token} did $${volFormatted} in ${timeframeLabel} volume - ${volume > 100000 ? 'that\'s solid! 🚀' : 'not bad! 👍'}`);
       
     case 'mcap':
     case 'marketcap':
@@ -313,17 +347,17 @@ function formatMetricResponse(token, searchResult, marketData, onChainData, metr
         mcap = marketData.reserveUSD * 2;
         console.log('Using fallback market cap (liquidity * 2):', mcap);
       }
-      return `💎 ${token}'s market cap is around $${formatNumber(mcap)} - that's ${mcap > 1000000 ? 'pretty healthy! 💪' : 'growing! 🌱'}`;
+      return addPoolLink(`💎 ${token}'s market cap is around $${formatNumber(mcap)} - that's ${mcap > 1000000 ? 'pretty healthy! 💪' : 'growing! 🌱'}`);
       
     case 'liquidity':
       const liqFormatted = formatNumber(marketData.reserveUSD);
-      return `💧 ${token} has $${liqFormatted} in liquidity - ${marketData.reserveUSD > 100000 ? 'solid depth! ✅' : 'getting there! 📊'}`;
+      return addPoolLink(`💧 ${token} has $${liqFormatted} in liquidity - ${marketData.reserveUSD > 100000 ? 'solid depth! ✅' : 'getting there! 📊'}`);
       
     case 'change':
     case 'price_change':
       const change = marketData[`change${timeframe}`] || marketData.change24h || 0;
       const emoji = change >= 0 ? '📈' : '📉';
-      return `${emoji} ${token} is ${change >= 0 ? 'up' : 'down'} ${Math.abs(change).toFixed(2)}% in the last ${timeframeLabel} - ${Math.abs(change) > 10 ? 'nice move! 💰' : 'steady as she goes! 😎'}`;
+      return addPoolLink(`${emoji} ${token} is ${change >= 0 ? 'up' : 'down'} ${Math.abs(change).toFixed(2)}% in the last ${timeframeLabel} - ${Math.abs(change) > 10 ? 'nice move! 💰' : 'steady as she goes! 😎'}`);
       
     case 'holders':
       // GeckoTerminal doesn't provide holders, would need to query from blockchain
@@ -372,9 +406,15 @@ function formatGeneralInfo(token, searchResult, marketData, onChainData) {
 📊 24h Volume: $${formatNumber(marketData.volume24h)}
 📈 24h Change: ${marketData.change24h >= 0 ? '+' : ''}${marketData.change24h.toFixed(2)}%
 
-📍 Contract: ${searchResult.tokenAddress}
-
-${marketData.change24h > 5 ? '🚀 Looking good! Trending up!' : marketData.change24h < -5 ? '📉 Taking a breather!' : '😎 Steady flow!'}`;
+📍 Contract: ${searchResult.tokenAddress}`;
+  
+  // Add pool link and chart if available
+  if (searchResult.poolAddress) {
+    const poolUrl = getChartUrl(searchResult.poolAddress);
+    info += `\n\n🔗 Pool: ${poolUrl}`;
+  }
+  
+  info += `\n\n${marketData.change24h > 5 ? '🚀 Looking good! Trending up!' : marketData.change24h < -5 ? '📉 Taking a breather!' : '😎 Steady flow!'}`;
   
   return info;
 }
@@ -391,10 +431,12 @@ function formatNumber(num) {
 
 /**
  * Get chart URL for a pool
- * @param {string} poolAddress - Pool contract address
+ * @param {string} poolAddress - Pool contract address (with or without network prefix)
  * @returns {string} Chart URL
  */
 export function getChartUrl(poolAddress) {
+  // Handle both formats: "0x..." or "somnia_0x..."
+  const poolId = poolAddress.includes('_') ? poolAddress : `${SOMNIA_NETWORK}_${poolAddress}`;
   return `https://www.geckoterminal.com/${SOMNIA_NETWORK}/pools/${poolAddress}`;
 }
 
