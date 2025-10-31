@@ -13,20 +13,49 @@ export async function searchToken(query) {
   try {
     // If it's an address, use it directly
     if (query.startsWith('0x')) {
-      const pools = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}`).then(r => r.json());
-      
-      if (pools.data && pools.data.attributes) {
+      const tokenResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}`).then(r => r.json());
+      let tokenSymbol, tokenName, decimals;
+      if (tokenResp?.data?.attributes) {
+        tokenSymbol = tokenResp.data.attributes.symbol || 'UNKNOWN';
+        tokenName = tokenResp.data.attributes.name || 'Unknown Token';
+        decimals = tokenResp.data.attributes.decimals || 18;
+      }
+
+      // Fetch pools for this token and pick the most liquid one
+      let poolAddress = undefined;
+      let liquidity = 0;
+      try {
+        const poolsResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}/pools`).then(r => r.json());
+        console.log('Pools for token:', query, poolsResp?.data?.length || 0, 'pools found');
+        if (poolsResp?.data?.length) {
+          const best = poolsResp.data
+            .map(p => ({ id: p.id, liq: parseFloat(p.attributes?.reserve_in_usd || '0') }))
+            .sort((a, b) => b.liq - a.liq)[0];
+          if (best && best.id) {
+            // Pool ID comes as "somnia_0x..." but API needs just "0x..."
+            poolAddress = best.id.includes('_') ? best.id.split('_')[1] : best.id;
+            liquidity = best.liq;
+            console.log('Selected pool:', poolAddress, '(original:', best.id, ')');
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching pools:', err.message);
+      }
+
+      if (tokenSymbol) {
         return {
           tokenAddress: query,
-          tokenSymbol: pools.data.attributes.symbol || 'UNKNOWN',
-          tokenName: pools.data.attributes.name || 'Unknown Token',
-          decimals: pools.data.attributes.decimals || 18
+          tokenSymbol,
+          tokenName,
+          decimals: decimals || 18,
+          poolAddress,
+          liquidity
         };
       }
     }
     
     // Search by symbol
-    const response = await fetch(`${GECKOTERMINAL_BASE}/search/pools?query=${query}&network=${SOMNIA_NETWORK}`);
+    const response = await fetch(`${GECKOTERMINAL_BASE}/search/pools?query=${encodeURIComponent(query)}&network=${SOMNIA_NETWORK}`);
     const data = await response.json();
     
     if (!data.data || data.data.length === 0) {
@@ -40,11 +69,14 @@ export async function searchToken(query) {
     const baseToken = bestPool.attributes?.base_token || {};
     const tokenAddress = bestPool.relationships?.base_token?.data?.id?.split('_')[1] || query;
     
+    // Pool ID comes as "somnia_0x..." but API needs just "0x..."
+    const poolId = bestPool.id.includes('_') ? bestPool.id.split('_')[1] : bestPool.id;
+    
     return {
       tokenAddress,
       tokenSymbol: baseToken.symbol || query,
       tokenName: baseToken.name || 'Unknown Token',
-      poolAddress: bestPool.id,
+      poolAddress: poolId,
       liquidity: parseFloat(bestPool.attributes?.reserve_in_usd) || 0
     };
   } catch (error) {
@@ -60,10 +92,17 @@ export async function searchToken(query) {
  */
 export async function getMarketData(poolAddress) {
   try {
+    if (!poolAddress) {
+      console.error('No pool address provided to getMarketData');
+      return null;
+    }
+    console.log('Fetching market data for pool:', poolAddress);
     const response = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/pools/${poolAddress}`);
     const data = await response.json();
+    console.log('Market data response:', data?.data ? 'has data' : 'no data', data?.errors ? 'errors:' + JSON.stringify(data.errors) : '');
     
     if (!data.data || !data.data.attributes) {
+      console.error('Invalid market data response for pool:', poolAddress);
       return null;
     }
     
@@ -257,4 +296,5 @@ function formatNumber(num) {
 export function getChartUrl(poolAddress) {
   return `https://www.geckoterminal.com/${SOMNIA_NETWORK}/pools/${poolAddress}`;
 }
+
 

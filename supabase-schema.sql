@@ -10,5 +10,6 @@ create table if not exists deeza_users (
 );
 
 create index if not exists idx_telegram_id on deeza_users(telegram_id);
+
 create index if not exists idx_wallet_address on deeza_users(wallet_address);
 create index if not exists idx_telegram_username on deeza_users(telegram_username);

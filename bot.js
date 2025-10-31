@@ -6,6 +6,7 @@ import CryptoJS from 'crypto-js';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { handleTokenQuery } from './support/tokenInfo.js';
+import { swapEthToToken, quoteEthToToken } from './support/swap.js';
 dotenv.config();
 
 // Initialize
@@ -14,9 +15,26 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Network Config - MAINNET ONLY
-const SOMNIA_RPC = 'https://somnia.publicnode.com';
+const SOMNIA_RPC = process.env.SOMNIA_RPC || 'https://somnia.publicnode.com';
 const SOMNIA_EXPLORER = 'https://explorer.somnia.network/';
-const provider = new ethers.JsonRpcProvider(SOMNIA_RPC);
+// Create provider - suppress network detection warnings by using explicit network
+const provider = new ethers.JsonRpcProvider(SOMNIA_RPC, {
+  chainId: parseInt(process.env.SOMNIA_CHAIN_ID || '5031'),
+  name: 'somnia'
+});
+// Override _detectNetwork to prevent retries (hack but works)
+provider._detectNetwork = async () => ({ chainId: parseInt(process.env.SOMNIA_CHAIN_ID || '5031'), name: 'somnia' });
+
+// Router and WETH (WSOMI) for swaps
+const ROUTER_ADDRESS = '0xCdE9aFDca1AdAb5b5C6E4F9e16c9802C88Dc7e1A'; // SomniExchangerRouter02
+const WETH_ADDRESS = '0x046EDe9564A72571df6F5e44d0405360c0f4dCab';   // WSOMI
+
+// Minimal UniswapV2 Router ABI
+const ROUTER_ABI = [
+  'function WETH() view returns (address)',
+  'function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts)',
+  'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)'
+];
 
 // Contracts
 const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS;
@@ -202,105 +220,17 @@ Data: ${JSON.stringify(existingContext.context_data)}
 If user provides a number/amount or clarification, complete the pending action!
 ` : '';
 
-    const systemPrompt = `You are Deeza - an AI Crypto Bro! 🔥 You're super friendly, chatty, and know everything about crypto. Think of yourself as that cool friend who's always up on the latest crypto moves. Be conversational, use emojis liberally, and make users feel like they're talking to their crypto homie. You're not a robot - you're Deeza! 😎
+    const systemPrompt = `You are Deeza — a chill, conversational, helpful "crypto bro." You help users with swaps, prices, limit orders, and sticking together in the crypto trenches. Your signature emoji is 😉. Use 😉 intentionally for confirmations or when you're being supportive. Sometimes, when users make cool moves (like a token send), react with 😁 in Telegram. Your vibe: "we trenches bro, stick together." Help with token sends, limit orders, comparisons, and wallet info. Keep it real, minimal emojis, and always conversational.
 
-CURRENT USER CONTEXT:
-- Wallet: ${userData.wallet_address}
-- STT Balance: ${sttBalance.balance || '0'} STT (~$${sttUSD.toFixed(2)})
-- USDC Balance: ${usdcBalance.balance || '0'} USDC
-- Has Gas: ${hasGas ? 'YES' : 'NO'}
-- STT Price: $${sttPrice.toFixed(4)}
-- USDC Cooldown: ${usdcCooldown === 0 ? 'AVAILABLE' : usdcCooldown > 0 ? `${Math.floor(usdcCooldown/3600)}h ${Math.floor((usdcCooldown%3600)/60)}m` : 'N/A'}
-
-${contextInfo}
-
-CAPABILITIES:
-1. Send tokens by AMOUNT or USD value (e.g., "send $5 worth of STT")
-2. Balance checks for any token
-3. TOKEN QUERIES - Answer questions about any token on Somnia (price, volume, market cap, liquidity, holders, change)
-4. Follow-up conversation (remembers context for 5 minutes)
+ALWAYS return a single JSON response with keys: action, params, message. DO NOT output just plain text or any extra description. ONLY produce a single JSON object, nothing else.
 
 RESPONSE FORMAT (JSON):
 {
-  "action": "send_token" | "send_usd" | "balance_check" | "lookup_user" | "token_query" | "wallet_info" | "chat" | "save_context",
-  "params": {
-    "token_symbol": "STT" | "USDC" | null,
-    "token_address": "0x..." or null,
-    "amount": number or null,
-    "usd_amount": number or null,
-    "recipient": "@username" or "0x..." or null,
-    "tokens": ["TOKEN_NAME"] or null,
-    "metric": "price" | "volume" | "mcap" | "liquidity" | "holders" | "change",
-    "timeframe": "1h" | "6h" | "24h" | "7d" | "30d",
-    "context_data": {} // Data to save for follow-up
-  },
-  "message": "Plain text response - NO markdown"
+  "action": "chat",
+  "params": {},
+  "message": "I had trouble understanding that. Can you try rephrasing?"
 }
-
-KEY BEHAVIORS:
-
-1. USD CONVERSION:
-"send $5 of STT to @alice" → Calculate: $5 / $${sttPrice.toFixed(4)} = ~${(5/sttPrice).toFixed(2)} STT
-Check balance: ${sttBalance.balance} STT available
-Check user exists: @alice registered?
-Action: {"action":"send_usd","params":{"usd_amount":5,"token_symbol":"STT","recipient":"alice"},"message":"Sending $5 worth of STT (~${(5/sttPrice).toFixed(2)} STT) to @alice..."}
-
-2. FOLLOW-UP CONTEXT:
-User says: "send @david STT"
-You respond: {"action":"save_context","params":{"context_data":{"action":"send_token","token_symbol":"STT","recipient":"david"}},"message":"How much STT would you like to send to @david?"}
-[Context saved for 5 minutes]
-
-User says: "6"
-You see context and respond: {"action":"send_token","params":{"amount":6,"token_symbol":"STT","recipient":"david"},"message":"Sending 6 STT to @david..."}
-
-3. TOKEN EXISTENCE CHECK:
-User: "check balance of 0xNonExistentToken"
-After checking: Token returns null
-Response: {"action":"chat","params":{},"message":"That token doesn't exist on Shannon Testnet! Want to check a different address?"}
-
-4. TOKEN QUERIES:
-User: "What's SOMI price?"
-→ {"action":"token_query","params":{"tokens":["SOMI"],"metric":"price"},"message":"Checking SOMI price..."}
-
-User: "PEPE volume?"
-→ {"action":"token_query","params":{"tokens":["PEPE"],"metric":"volume","timeframe":"24h"},"message":"Fetching PEPE trading volume..."}
-
-User: "Show me STT liquidity"
-→ {"action":"token_query","params":{"tokens":["STT"],"metric":"liquidity"},"message":"Checking STT liquidity..."}
-
-User: "Compare SOMI and PEPE market cap"
-→ {"action":"token_query","params":{"tokens":["SOMI","PEPE"],"metric":"mcap"},"message":"Comparing market caps..."}
-
-5. WALLET QUERIES:
-User: "What's my wallet address?"
-→ {"action":"wallet_info","params":{},"message":"Showing your wallet info..."}
-
-User: "Show me my wallet"
-→ {"action":"wallet_info","params":{},"message":"Pulling up your wallet..."}
-
-User: "My address"
-→ {"action":"wallet_info","params":{},"message":"Here's your wallet..."}
-
-6. SOMI CLARIFICATION:
-"send SOMI" → "Did you mean STT? (SOMI is mainnet, STT is testnet)"
-
-CRITICAL RULES:
-- NO markdown symbols (*, _, \`)
-- Be SUPER chatty, friendly, and use emojis! 😎
-- Make every response feel personal and conversational
-- Check if token exists before reporting balance
-- For USD sends: calculate amount, check balance, check user exists
-- Save context for incomplete requests
-- Use context to complete follow-ups
-- Think like a friendly banker who LOVES crypto
-
-TONE EXAMPLES:
-✅ "Hey! SOMI is sitting pretty at $0.0234 right now! 📈"
-✅ "Yo! PEPE just did $145K in 24h volume - that's solid! 🚀"  
-❌ "Price: $0.0234"
-❌ "Volume: $145K"
-
-Return ONLY JSON.`;
+`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
@@ -313,8 +243,10 @@ Return ONLY JSON.`;
     });
 
     const response = completion.choices[0].message.content.trim();
+    console.log('AI RAW RESPONSE:', response);
     const jsonMatch = response.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
+      console.error('AI responded without parseable JSON:', response); // extra debug log
       return {
         action: 'chat',
         params: {},
@@ -409,11 +341,33 @@ async function executeAction(action, params, userData, tgId) {
       const recipientDisplay = params.recipient.startsWith('0x')
         ? `${params.recipient.slice(0, 6)}...${params.recipient.slice(-4)}`
         : `@${params.recipient.replace('@', '')}`;
+      let confirmationMessage = `Sent ${params.amount} ${params.token_symbol} to ${recipientDisplay}! We stick together in these trenches 😉\n\nView: ${SOMNIA_EXPLORER}tx/${tx.hash}`;
 
+      // Telegram Reaction + Quoting
+      if (params._telegram_chat_id && params._telegram_message_id) {
+        try {
+          await bot.setMessageReaction(params._telegram_chat_id, params._telegram_message_id, {
+            reaction: [{ type: 'emoji', emoji: '😁' }]
+          });
+        } catch(err) {
+          console.error('Reaction error:', err.response?.body || err);
+        }
+        return {
+          success: true,
+          message: confirmationMessage,
+          quote_to_message_id: params._telegram_message_id
+        };
+      }
       return {
         success: true,
-        message: `Sent!\n\n${params.amount} ${params.token_symbol} → ${recipientDisplay}\n\nView: ${SOMNIA_EXPLORER}tx/${tx.hash}`
+        message: confirmationMessage
       };
+    }
+
+    // Handle ETH -> Token swap (SOMI -> Token)
+    if (action === 'swap_eth_to_token') {
+      const privateKey = decrypt(userData.encrypted_private_key);
+      return await swapEthToToken(params, { ...userData, privateKey }, provider);
     }
 
     // Handle balance checks
@@ -523,16 +477,16 @@ bot.onText(/\/(help|start)/, async (msg) => {
     const user = await getOrCreateUser(tgId, username);
 
     if (user.isNew) {
-      await bot.sendMessage(msg.chat.id, `Yo! 👋 I'm Deeza - your AI Crypto Bro on Somnia! 🔥\n\nGot your wallet set up:\n${user.wallet_address}\n\nI can help you:\n• Send tokens (just tell me how much and to who!)\n• Check any token price, volume, market cap - anything\n• Answer questions about what's going on in the market\n\nJust talk to me naturally - I got you! 😎`, { disable_web_page_preview: true });
+      await bot.sendMessage(msg.chat.id, `Hey there! I'm Deeza — your very own crypto bro on Somnia. 😎\n\nYour wallet is ready:\n${user.wallet_address}\n\nI can help you:\n• Send tokens\n• Place limit orders\n• Perform swaps & bridges\n• Launch tokens seamlessly with Deeza\n• Check token info/prices & compare coins\n\nDo it all without leaving your DMs — and get it on somnia.meme 😉`, { disable_web_page_preview: true });
 
       setTimeout(() => {
-        bot.sendMessage(msg.chat.id, `🔐 Your Private Key\n\n${user.privateKey}\n\n⚠️ Save this securely - it's your master key!`, { disable_web_page_preview: true });
+        bot.sendMessage(msg.chat.id, `🔐 Your Private Key\n\n${user.privateKey}\n\n⚠️ Save this securely — it's your master key!`, { disable_web_page_preview: true });
       }, 1000);
 
       return;
     }
 
-    bot.sendMessage(msg.chat.id, `Yo! 👋 I'm Deeza - your AI Crypto Bro! 🔥\n\nI can help you with:\n💰 Send tokens naturally - "send $5 of STT to @alice"\n📊 Check token prices - "What's SOMI price?"\n💧 Ask about liquidity - "Show me STT's liquidity"\n📈 Compare tokens - "Compare SOMI vs PEPE"\n💵 Check balances\n\nJust chat with me naturally - I got you covered! 😎`);
+    bot.sendMessage(msg.chat.id, `Hey there! I'm Deeza — your crypto bro. 😎\n\nI can help you with:\n💰 Send tokens naturally — "send $5 of STT to @alice"\n🌀 Perform swaps & bridges\n🚀 Launch tokens seamlessly with Deeza\n📊 Check token prices — "What's SOMI price?"\n💧 Ask about liquidity — "Show me STT's liquidity"\n📈 Compare tokens — "Compare SOMI vs PEPE"\n\nAll without leaving your DMs — get it on somnia.meme 😉`);
 
   } catch (error) {
     console.error('Help error:', error);
@@ -550,35 +504,92 @@ bot.on('message', async (msg) => {
   const firstName = msg.from.first_name || 'there';
 
   try {
+    // Show typing while we process
+    await bot.sendChatAction(msg.chat.id, 'typing');
+
     const user = await getOrCreateUser(tgId, username);
 
-    if (user.isNew) {
-      await bot.sendMessage(msg.chat.id, `Yo! 👋 I'm Deeza - your AI Crypto Bro on Somnia! 🔥\n\nGot your wallet set up:\n${user.wallet_address}\n\nI can help you:\n• Send tokens (just tell me how much and to who!)\n• Check any token price, volume, market cap - anything\n• Answer questions about what's going on in the market\n\nJust talk to me naturally - I got you! 😎`, { disable_web_page_preview: true });
-      setTimeout(() => bot.sendMessage(msg.chat.id, `🔐 Your Private Key\n\n${user.privateKey}\n\n⚠️ Save this securely - it's your master key!`, { disable_web_page_preview: true }), 1000);
-      return;
-    }
+    // Removed: new-user welcome here. Only /start shows welcome & keys.
 
     // Check for existing context
     const existingContext = await getContext(tgId);
 
+    // Quick confirm handler: if we have a pending swap and user says yes/sure/confirm
+    if (existingContext && existingContext.context_type === 'pending_action' && existingContext.context_data?.action === 'swap_eth_to_token') {
+      const text = (msg.text || '').toLowerCase().trim();
+      if (/^(y|yes|sure|confirm|do it|go|ok)$/i.test(text)) {
+        await bot.sendMessage(msg.chat.id, '...deezaing this', { reply_to_message_id: msg.message_id });
+        await bot.sendChatAction(msg.chat.id, 'typing');
+        const result = await executeAction('swap_eth_to_token', existingContext.context_data.params, user, tgId);
+        await clearContext(tgId);
+        if (result.message) {
+          await bot.sendMessage(msg.chat.id, result.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
+        }
+        return;
+      } else if (/^(n|no|cancel|stop)$/i.test(text)) {
+        await clearContext(tgId);
+        await bot.sendMessage(msg.chat.id, 'Cancelled. No swap executed.');
+        return;
+      }
+    }
+
     // Process with AI
     const aiResponse = await processWithAI(msg.text, user, firstName, existingContext);
 
-    // Save context if needed
+    try { await bot.setMessageReaction(msg.chat.id, msg.message_id, { reaction: [{ type: 'emoji', emoji: '😁' }] }); } catch {}
+
     if (aiResponse.action === 'save_context') {
       await saveContext(tgId, 'pending_action', aiResponse.params.context_data);
     }
 
-    // Send AI message
-    if (aiResponse.message) {
-      await bot.sendMessage(msg.chat.id, aiResponse.message, { disable_web_page_preview: true });
+    // Normalize actions (handle both snake_case and camelCase)
+    const actionAliases = { 'get_wallet_address':'wallet_info','getWalletAddress':'wallet_info','get_balance':'wallet_info','getBalance':'wallet_info','get_wallet_balance':'wallet_info','getWalletBalance':'wallet_info','show_wallet':'wallet_info','showWallet':'wallet_info','check_my_wallet':'wallet_info','checkMyWallet':'wallet_info','check_my_balance':'wallet_info','checkMyBalance':'wallet_info','swap':'swap_eth_to_token','swap_somi':'swap_eth_to_token','swap_eth_to_token':'swap_eth_to_token' };
+    const metricMap = { 'fetch_marketcap':'mcap','fetchMarketcap':'mcap','fetchMarketCap':'mcap','fetch_price':'price','fetchPrice':'price','fetch_liquidity':'liquidity','fetchLiquidity':'liquidity','fetch_volume':'volume','fetchVolume':'volume','fetch_change':'change','fetchChange':'change','token_info':null,'tokenInfo':null };
+    
+    if (aiResponse.action && actionAliases[aiResponse.action]) {
+      aiResponse.action = actionAliases[aiResponse.action];
+    } else if (aiResponse.action && metricMap.hasOwnProperty(aiResponse.action)) {
+      aiResponse.params = aiResponse.params || {};
+      const tokenSymbol = aiResponse.params.token || aiResponse.params.symbol || aiResponse.params.query;
+      aiResponse.action = 'token_query';
+      aiResponse.params.tokens = tokenSymbol ? [tokenSymbol] : (aiResponse.params.tokens || []);
+      const mm = metricMap[aiResponse.action];
+      if (mm) aiResponse.params.metric = mm;
+      if ((aiResponse.params.metric === 'volume' || aiResponse.params.metric === 'change') && !aiResponse.params.timeframe) aiResponse.params.timeframe = '24h';
     }
 
-    // Execute action
-    if (['send_token', 'send_usd', 'mint_usdc', 'lookup_user', 'balance_check', 'token_query', 'wallet_info'].includes(aiResponse.action)) {
+    if (['send_token'].includes(aiResponse.action)) {
+      aiResponse.params = aiResponse.params || {};
+      aiResponse.params._telegram_chat_id = msg.chat.id;
+      aiResponse.params._telegram_message_id = msg.message_id;
+    }
+
+    if (aiResponse.message) {
+      await bot.sendMessage(msg.chat.id, aiResponse.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
+    }
+
+    // Execution actions
+    const executionActions = ['send_token','send_usd','mint_usdc','token_query','wallet_info','balance_check','swap_eth_to_token'];
+
+    // For swaps, do quote + save context first, require confirmation
+    if (aiResponse.action === 'swap_eth_to_token') {
+      const privateKey = decrypt(user.encrypted_private_key);
+      const quote = await quoteEthToToken(aiResponse.params, { ...user, privateKey }, provider);
+      if (!quote.success) {
+        await bot.sendMessage(msg.chat.id, quote.message, { reply_to_message_id: msg.message_id });
+        return;
+      }
+      await bot.sendMessage(msg.chat.id, quote.message, { reply_to_message_id: msg.message_id });
+      await saveContext(tgId, 'pending_action', { action: 'swap_eth_to_token', params: aiResponse.params });
+      return;
+    }
+
+    if (executionActions.includes(aiResponse.action)) {
+      await bot.sendMessage(msg.chat.id, '...deezaing this', { reply_to_message_id: msg.message_id });
+      await bot.sendChatAction(msg.chat.id, 'typing');
       const result = await executeAction(aiResponse.action, aiResponse.params, user, tgId);
       if (result.message) {
-        await bot.sendMessage(msg.chat.id, result.message, { disable_web_page_preview: true });
+        await bot.sendMessage(msg.chat.id, result.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
       }
     }
 
