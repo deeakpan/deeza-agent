@@ -24,6 +24,7 @@ export async function searchToken(query) {
       // Fetch pools for this token and pick the most liquid one
       let poolAddress = undefined;
       let liquidity = 0;
+      let fdv_usd = 0; // Fully Diluted Valuation (market cap)
       try {
         const poolsResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}/pools`).then(r => r.json());
         console.log('Pools for token:', query, poolsResp?.data?.length || 0, 'pools found');
@@ -41,6 +42,12 @@ export async function searchToken(query) {
       } catch (err) {
         console.error('Error fetching pools:', err.message);
       }
+      
+      // Check token endpoint for FDV (market cap)
+      if (tokenResp?.data?.attributes?.fdv_usd) {
+        fdv_usd = parseFloat(tokenResp.data.attributes.fdv_usd);
+        console.log('Found FDV from token endpoint:', fdv_usd);
+      }
 
       if (tokenSymbol) {
         return {
@@ -49,7 +56,8 @@ export async function searchToken(query) {
           tokenName,
           decimals: decimals || 18,
           poolAddress,
-          liquidity
+          liquidity,
+          fdv_usd
         };
       }
     }
@@ -108,16 +116,37 @@ export async function getMarketData(poolAddress) {
     
     const attrs = data.data.attributes;
     
+    // Debug: Log available attribute keys
+    if (!attrs.base_token_price_usd && !attrs.base_token?.price_usd) {
+      console.log('Available price fields:', Object.keys(attrs).filter(k => k.toLowerCase().includes('price')));
+      console.log('Base token object keys:', attrs.base_token ? Object.keys(attrs.base_token) : 'no base_token');
+    }
+    
+    // Try multiple price field names - GeckoTerminal may use different formats
+    // Check nested base_token object first
+    const price = parseFloat(
+      attrs.base_token?.price_usd || 
+      attrs.base_token_price_usd || 
+      attrs.price_usd || 
+      attrs.token_price_usd || 
+      '0'
+    );
+    
+    console.log('Price extraction - base_token_price_usd:', attrs.base_token_price_usd, 'base_token.price_usd:', attrs.base_token?.price_usd, 'final price:', price);
+    
     return {
-      price: parseFloat(attrs.base_token_price_usd) || 0,
-      reserveUSD: parseFloat(attrs.reserve_in_usd) || 0, // Liquidity
-      volume24h: parseFloat(attrs.volume_usd?.h24) || 0,
-      volume7d: parseFloat(attrs.volume_usd?.d7) || 0,
-      volume1h: parseFloat(attrs.volume_usd?.h1) || 0,
-      change24h: parseFloat(attrs.price_change_percentage?.h24) || 0,
-      change7d: parseFloat(attrs.price_change_percentage?.d7) || 0,
-      change1h: parseFloat(attrs.price_change_percentage?.h1) || 0,
-      transactions24h: attrs.transactions?.h24 || {}
+      price: price || 0,
+      reserveUSD: parseFloat(attrs.reserve_in_usd || attrs.reserve_usd || '0'), // Liquidity
+      volume24h: parseFloat(attrs.volume_usd?.h24 || attrs.volume_usd?.h24 || '0'),
+      volume7d: parseFloat(attrs.volume_usd?.d7 || '0'),
+      volume1h: parseFloat(attrs.volume_usd?.h1 || '0'),
+      change24h: parseFloat(attrs.price_change_percentage?.h24 || attrs.price_change_percentage?.h24 || '0'),
+      change7d: parseFloat(attrs.price_change_percentage?.d7 || '0'),
+      change1h: parseFloat(attrs.price_change_percentage?.h1 || '0'),
+      transactions24h: attrs.transactions?.h24 || {},
+      // Additional fields for market cap calculation
+      baseToken: attrs.base_token,
+      quoteToken: attrs.quote_token
     };
   } catch (error) {
     console.error('Get market data error:', error);
@@ -142,12 +171,38 @@ export async function getTokenOnChainData(tokenAddress, provider) {
     
     const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
     
-    const [decimals, symbol, name, totalSupply] = await Promise.all([
+    // Fetch basic info first (these are usually more reliable)
+    const [decimals, symbol, name] = await Promise.all([
       contract.decimals().catch(() => 18),
       contract.symbol().catch(() => 'UNKNOWN'),
-      contract.name().catch(() => 'Unknown Token'),
-      contract.totalSupply().catch(() => 0)
+      contract.name().catch(() => 'Unknown Token')
     ]);
+    
+    // Fetch totalSupply with retry logic to handle network errors
+    let totalSupply = BigInt(0);
+    let supplyError = null;
+    
+    // Try up to 3 times with delays
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          // Wait before retry
+          await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+        }
+        totalSupply = await contract.totalSupply();
+        supplyError = null;
+        break;
+      } catch (e) {
+        supplyError = e;
+        console.error(`TotalSupply fetch attempt ${attempt + 1} failed for ${tokenAddress}:`, e.message);
+      }
+    }
+    
+    if (supplyError) {
+      console.warn('Could not fetch totalSupply after retries, using 0');
+    }
+    
+    console.log('On-chain data fetched:', { tokenAddress, decimals, symbol, name, totalSupply: totalSupply.toString(), hasSupply: totalSupply > 0 });
     
     return {
       decimals,
@@ -199,6 +254,7 @@ export async function handleTokenQuery(params, provider) {
       token,
       searchResult,
       marketData,
+      onChainData,
       metric,
       timeframe
     );
@@ -212,7 +268,7 @@ export async function handleTokenQuery(params, provider) {
 /**
  * Format metric response based on user query
  */
-function formatMetricResponse(token, searchResult, marketData, metric, timeframe = '24h') {
+function formatMetricResponse(token, searchResult, marketData, onChainData, metric, timeframe = '24h') {
   const timeframeMap = {
     '1h': '1 hour',
     '6h': '6 hours',
@@ -229,7 +285,7 @@ function formatMetricResponse(token, searchResult, marketData, metric, timeframe
   
   switch (metric) {
     case 'price':
-      return `💰 Hey! ${token} is sitting at $${marketData.price.toFixed(4)} right now! 📈`;
+      return `💰 Hey! ${token} is sitting at $${marketData.price.toFixed(6)} right now! 📈`;
       
     case 'volume':
       const volume = marketData[`volume${timeframe}`] || marketData.volume24h || 0;
@@ -238,8 +294,25 @@ function formatMetricResponse(token, searchResult, marketData, metric, timeframe
       
     case 'mcap':
     case 'marketcap':
-      // Estimate market cap = price * total supply
-      const mcap = marketData.reserveUSD * 2;
+      console.log('Market cap calculation - searchResult.fdv_usd:', searchResult.fdv_usd, 'price:', marketData.price, 'onChainData:', onChainData ? 'exists' : 'null', 'totalSupply:', onChainData?.totalSupply);
+      // Priority: 1) FDV from GeckoTerminal, 2) On-chain calculation, 3) Fallback
+      let mcap = 0;
+      
+      if (searchResult.fdv_usd && searchResult.fdv_usd > 0) {
+        // Use FDV from GeckoTerminal (most accurate)
+        mcap = searchResult.fdv_usd;
+        console.log('Using FDV from GeckoTerminal:', mcap);
+      } else if (marketData.price > 0 && onChainData && onChainData.totalSupply && onChainData.totalSupply !== '0') {
+        // Calculate from price * supply
+        const decimals = onChainData.decimals || 18;
+        const supply = parseFloat(ethers.formatUnits(onChainData.totalSupply, decimals));
+        mcap = marketData.price * supply;
+        console.log('Calculated market cap from on-chain:', mcap, 'supply:', supply);
+      } else {
+        // Fallback to liquidity estimate
+        mcap = marketData.reserveUSD * 2;
+        console.log('Using fallback market cap (liquidity * 2):', mcap);
+      }
       return `💎 ${token}'s market cap is around $${formatNumber(mcap)} - that's ${mcap > 1000000 ? 'pretty healthy! 💪' : 'growing! 🌱'}`;
       
     case 'liquidity':
@@ -258,17 +331,43 @@ function formatMetricResponse(token, searchResult, marketData, metric, timeframe
       
     default:
       // Return general info if no specific metric
-      return formatGeneralInfo(token, searchResult, marketData);
+      return formatGeneralInfo(token, searchResult, marketData, onChainData);
   }
 }
 
 /**
  * Format general token info
  */
-function formatGeneralInfo(token, searchResult, marketData) {
-  return `📊 ${token} Info - Let's see what's going on! 📈
+function formatGeneralInfo(token, searchResult, marketData, onChainData) {
+  console.log('formatGeneralInfo - searchResult.fdv_usd:', searchResult.fdv_usd, 'onChainData:', onChainData ? 'exists' : 'null', 'totalSupply:', onChainData?.totalSupply);
+  
+  // Calculate market cap - Priority: FDV > On-chain > Fallback
+  let mcap = 0;
+  if (searchResult.fdv_usd && searchResult.fdv_usd > 0) {
+    mcap = searchResult.fdv_usd;
+    console.log('General info - using FDV from GeckoTerminal:', mcap);
+  } else if (marketData.price > 0 && onChainData && onChainData.totalSupply && onChainData.totalSupply !== '0') {
+    const decimals = onChainData.decimals || 18;
+    const supply = parseFloat(ethers.formatUnits(onChainData.totalSupply, decimals));
+    mcap = marketData.price * supply;
+    console.log('General info - calculated market cap:', mcap);
+  } else {
+    // Fallback to liquidity estimate if we don't have on-chain data
+    mcap = marketData.reserveUSD * 2;
+    console.log('General info - using fallback market cap:', mcap);
+  }
+  
+  // Format price with appropriate decimals
+  const priceFormatted = marketData.price > 0.01 
+    ? marketData.price.toFixed(4) 
+    : marketData.price.toFixed(6);
+  
+  let info = `📊 ${token} Info - Let's see what's going on! 📈
 
-💵 Price: $${marketData.price.toFixed(4)}
+💵 Price: $${priceFormatted}
+💎 Market Cap: $${formatNumber(mcap)}`;
+  
+  info += `
 💧 Liquidity: $${formatNumber(marketData.reserveUSD)}
 📊 24h Volume: $${formatNumber(marketData.volume24h)}
 📈 24h Change: ${marketData.change24h >= 0 ? '+' : ''}${marketData.change24h.toFixed(2)}%
@@ -276,6 +375,8 @@ function formatGeneralInfo(token, searchResult, marketData) {
 📍 Contract: ${searchResult.tokenAddress}
 
 ${marketData.change24h > 5 ? '🚀 Looking good! Trending up!' : marketData.change24h < -5 ? '📉 Taking a breather!' : '😎 Steady flow!'}`;
+  
+  return info;
 }
 
 /**

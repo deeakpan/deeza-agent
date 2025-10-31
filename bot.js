@@ -544,16 +544,17 @@ bot.on('message', async (msg) => {
 
     // Normalize actions (handle both snake_case and camelCase)
     const actionAliases = { 'get_wallet_address':'wallet_info','getWalletAddress':'wallet_info','get_balance':'wallet_info','getBalance':'wallet_info','get_wallet_balance':'wallet_info','getWalletBalance':'wallet_info','show_wallet':'wallet_info','showWallet':'wallet_info','check_my_wallet':'wallet_info','checkMyWallet':'wallet_info','check_my_balance':'wallet_info','checkMyBalance':'wallet_info','swap':'swap_eth_to_token','swap_somi':'swap_eth_to_token','swap_eth_to_token':'swap_eth_to_token' };
-    const metricMap = { 'fetch_marketcap':'mcap','fetchMarketcap':'mcap','fetchMarketCap':'mcap','fetch_price':'price','fetchPrice':'price','fetch_liquidity':'liquidity','fetchLiquidity':'liquidity','fetch_volume':'volume','fetchVolume':'volume','fetch_change':'change','fetchChange':'change','token_info':null,'tokenInfo':null };
+    const metricMap = { 'fetch_marketcap':'mcap','fetch_market_cap':'mcap','fetchMarketcap':'mcap','fetchMarketCap':'mcap','fetch_price':'price','fetchPrice':'price','fetch_liquidity':'liquidity','fetchLiquidity':'liquidity','fetch_volume':'volume','fetchVolume':'volume','fetch_change':'change','fetchChange':'change','token_info':null,'tokenInfo':null };
     
     if (aiResponse.action && actionAliases[aiResponse.action]) {
       aiResponse.action = actionAliases[aiResponse.action];
     } else if (aiResponse.action && metricMap.hasOwnProperty(aiResponse.action)) {
       aiResponse.params = aiResponse.params || {};
       const tokenSymbol = aiResponse.params.token || aiResponse.params.symbol || aiResponse.params.query;
+      // Get metric BEFORE changing action
+      const mm = metricMap[aiResponse.action];
       aiResponse.action = 'token_query';
       aiResponse.params.tokens = tokenSymbol ? [tokenSymbol] : (aiResponse.params.tokens || []);
-      const mm = metricMap[aiResponse.action];
       if (mm) aiResponse.params.metric = mm;
       if ((aiResponse.params.metric === 'volume' || aiResponse.params.metric === 'change') && !aiResponse.params.timeframe) aiResponse.params.timeframe = '24h';
     }
