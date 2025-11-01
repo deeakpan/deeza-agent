@@ -1,8 +1,47 @@
 // Token Info Module - GeckoTerminal Integration
 import { ethers } from 'ethers';
+import puppeteer from 'puppeteer';
 
 const GECKOTERMINAL_BASE = 'https://api.geckoterminal.com/api/v2';
 const SOMNIA_NETWORK = 'somnia';
+
+/**
+ * Fetch with timeout and retry logic
+ * @param {string} url - URL to fetch
+ * @param {Object} options - Fetch options
+ * @param {number} retries - Number of retry attempts
+ * @param {number} timeout - Timeout in milliseconds
+ * @returns {Promise<Response>}
+ */
+async function fetchWithRetry(url, options = {}, retries = 3, timeout = 30000) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      return response;
+    } catch (error) {
+      if (attempt === retries - 1) {
+        throw error; // Last attempt, throw the error
+      }
+      console.warn(`Fetch attempt ${attempt + 1} failed for ${url}:`, error.message);
+      // Wait before retry (exponential backoff)
+      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+  }
+}
 
 /**
  * Search for a token by symbol or address
@@ -13,7 +52,7 @@ export async function searchToken(query) {
   try {
     // If it's an address, use it directly
     if (query.startsWith('0x')) {
-      const tokenResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}`).then(r => r.json());
+      const tokenResp = await fetchWithRetry(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}`).then(r => r.json());
       let tokenSymbol, tokenName, decimals;
       if (tokenResp?.data?.attributes) {
         tokenSymbol = tokenResp.data.attributes.symbol || 'UNKNOWN';
@@ -26,7 +65,7 @@ export async function searchToken(query) {
       let liquidity = 0;
       let fdv_usd = 0; // Fully Diluted Valuation (market cap)
       try {
-        const poolsResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}/pools`).then(r => r.json());
+        const poolsResp = await fetchWithRetry(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${query}/pools`).then(r => r.json());
         console.log('Pools for token:', query, poolsResp?.data?.length || 0, 'pools found');
         if (poolsResp?.data?.length) {
           const best = poolsResp.data
@@ -71,7 +110,7 @@ export async function searchToken(query) {
     }
     
     // Search by symbol
-    const response = await fetch(`${GECKOTERMINAL_BASE}/search/pools?query=${encodeURIComponent(query)}&network=${SOMNIA_NETWORK}`);
+    const response = await fetchWithRetry(`${GECKOTERMINAL_BASE}/search/pools?query=${encodeURIComponent(query)}&network=${SOMNIA_NETWORK}`);
     const data = await response.json();
     
     if (!data.data || data.data.length === 0) {
@@ -92,7 +131,7 @@ export async function searchToken(query) {
     let fdv_usd = 0;
     if (tokenAddress && tokenAddress.startsWith('0x')) {
       try {
-        const tokenResp = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${tokenAddress}`).then(r => r.json());
+        const tokenResp = await fetchWithRetry(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/tokens/${tokenAddress}`).then(r => r.json());
         if (tokenResp?.data?.attributes?.fdv_usd) {
           fdv_usd = parseFloat(tokenResp.data.attributes.fdv_usd);
           console.log('Found FDV from token endpoint (symbol search):', fdv_usd);
@@ -131,7 +170,7 @@ export async function getMarketData(poolAddress) {
       return null;
     }
     console.log('Fetching market data for pool:', poolAddress);
-    const response = await fetch(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/pools/${poolAddress}`);
+    const response = await fetchWithRetry(`${GECKOTERMINAL_BASE}/networks/${SOMNIA_NETWORK}/pools/${poolAddress}`);
     const data = await response.json();
     console.log('Market data response:', data?.data ? 'has data' : 'no data', data?.errors ? 'errors:' + JSON.stringify(data.errors) : '');
     
@@ -186,7 +225,7 @@ export async function getMarketData(poolAddress) {
  * @param {Object} provider - Ethers provider
  * @returns {Promise<Object>} On-chain token data
  */
-export async function getTokenOnChainData(tokenAddress, provider) {
+export async function getTokenOnChainData(tokenAddress, provider, geckoData = null) {
   try {
     const ERC20_ABI = [
       'function decimals() view returns (uint8)',
@@ -197,12 +236,29 @@ export async function getTokenOnChainData(tokenAddress, provider) {
     
     const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
     
-    // Fetch basic info first (these are usually more reliable)
-    const [decimals, symbol, name] = await Promise.all([
-      contract.decimals().catch(() => 18),
-      contract.symbol().catch(() => 'UNKNOWN'),
-      contract.name().catch(() => 'Unknown Token')
-    ]);
+    // Fetch basic info first - use GeckoTerminal data as fallback if available
+    let decimals, symbol, name;
+    try {
+      [decimals, symbol, name] = await Promise.all([
+        contract.decimals(),
+        contract.symbol(),
+        contract.name()
+      ]);
+    } catch (error) {
+      // If any call fails, use GeckoTerminal fallback
+      decimals = geckoData?.decimals || 18;
+      symbol = geckoData?.tokenSymbol || 'UNKNOWN';
+      name = geckoData?.tokenName || 'Unknown Token';
+    }
+    
+    // Use GeckoTerminal data if on-chain values are empty or default
+    const finalDecimals = decimals || geckoData?.decimals || 18;
+    const finalSymbol = (!symbol || symbol === 'UNKNOWN' || symbol.trim() === '') && geckoData?.tokenSymbol 
+      ? geckoData.tokenSymbol 
+      : symbol;
+    const finalName = (!name || name === 'Unknown Token' || name.trim() === '') && geckoData?.tokenName 
+      ? geckoData.tokenName 
+      : name;
     
     // Fetch totalSupply with retry logic to handle network errors
     let totalSupply = BigInt(0);
@@ -228,12 +284,22 @@ export async function getTokenOnChainData(tokenAddress, provider) {
       console.warn('Could not fetch totalSupply after retries, using 0');
     }
     
-    console.log('On-chain data fetched:', { tokenAddress, decimals, symbol, name, totalSupply: totalSupply.toString(), hasSupply: totalSupply > 0 });
+    const usedGeckoFallback = (symbol === 'UNKNOWN' || name === 'Unknown Token') && geckoData;
+    
+    console.log('On-chain data fetched:', { 
+      tokenAddress, 
+      decimals: finalDecimals, 
+      symbol: finalSymbol, 
+      name: finalName, 
+      totalSupply: totalSupply.toString(), 
+      hasSupply: totalSupply > 0,
+      usedGeckoFallback: usedGeckoFallback ? true : false
+    });
     
     return {
-      decimals,
-      symbol,
-      name,
+      decimals: finalDecimals,
+      symbol: finalSymbol,
+      name: finalName,
       totalSupply: totalSupply.toString()
     };
   } catch (error) {
@@ -262,7 +328,10 @@ export async function handleTokenQuery(params, provider) {
     const searchResult = await searchToken(token);
     
     if (!searchResult) {
-      responses.push(`Hmm, I couldn't find ${token} on Somnia! 😕 Make sure you spelled it right or try a different token. Maybe it's listed somewhere else?`);
+      responses.push({
+        message: `Hmm, I couldn't find ${token} on Somnia! 😕 Make sure you spelled it right or try a different token. Maybe it's listed somewhere else?`,
+        poolAddress: null
+      });
       continue;
     }
     
@@ -272,8 +341,12 @@ export async function handleTokenQuery(params, provider) {
       marketData = await getMarketData(searchResult.poolAddress);
     }
     
-    // 3. Get on-chain data
-    const onChainData = await getTokenOnChainData(searchResult.tokenAddress, provider);
+    // 3. Get on-chain data (pass GeckoTerminal data as fallback)
+    const onChainData = await getTokenOnChainData(searchResult.tokenAddress, provider, {
+      tokenSymbol: searchResult.tokenSymbol,
+      tokenName: searchResult.tokenName,
+      decimals: searchResult.decimals
+    });
     
     // 4. Extract metric and format response
     let response = formatMetricResponse(
@@ -285,10 +358,13 @@ export async function handleTokenQuery(params, provider) {
       timeframe
     );
     
-    responses.push(response);
+    responses.push({
+      message: response,
+      poolAddress: searchResult.poolAddress
+    });
   }
   
-  return responses.join('\n\n');
+  return responses;
 }
 
 /**
@@ -438,6 +514,114 @@ export function getChartUrl(poolAddress) {
   // Handle both formats: "0x..." or "somnia_0x..."
   const poolId = poolAddress.includes('_') ? poolAddress : `${SOMNIA_NETWORK}_${poolAddress}`;
   return `https://www.geckoterminal.com/${SOMNIA_NETWORK}/pools/${poolAddress}`;
+}
+
+/**
+ * Take a screenshot of GeckoTerminal chart
+ * @param {string} poolAddress - Pool contract address
+ * @returns {Promise<Buffer|null>} Screenshot buffer or null if failed
+ */
+export async function getChartScreenshot(poolAddress) {
+  let browser = null;
+  try {
+    const chartUrl = getChartUrl(poolAddress);
+    
+    // Launch browser
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    });
+    
+    const page = await browser.newPage();
+    
+    // Set viewport for chart (larger to capture more of the page)
+    await page.setViewport({ width: 1280, height: 720 });
+    
+    // Navigate to chart page with longer timeout and less strict wait
+    await page.goto(chartUrl, {
+      waitUntil: 'domcontentloaded', // Less strict - just wait for DOM, not all network
+      timeout: 60000 // 60 seconds timeout
+    }).catch(async (error) => {
+      // If navigation times out, try to continue anyway
+      console.warn('Navigation timeout, continuing with screenshot attempt:', error.message);
+    });
+    
+    // Wait for chart to load - give it more time
+    await new Promise(resolve => setTimeout(resolve, 8000));
+    
+    // Try to wait for chart canvas or any chart-related element (with shorter timeout)
+    try {
+      await page.waitForSelector('canvas, [class*="chart"], [id*="chart"]', { timeout: 5000 }).catch(() => {});
+    } catch (e) {
+      // Ignore if selector not found - we'll screenshot anyway
+      console.log('Chart element not found, will screenshot viewport');
+    }
+    
+    // Take screenshot - wait for actual chart content to be visible
+    let screenshot;
+    try {
+      // Wait a bit more for chart to fully render
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      // Scroll down a bit to ensure chart is in view
+      await page.evaluate(() => {
+        window.scrollBy(0, 125); // Scroll down 125px
+      });
+      await new Promise(resolve => setTimeout(resolve, 500)); // Wait for scroll to settle
+      
+      // Check if page has loaded content (not blank)
+      const pageContent = await page.content();
+      if (!pageContent || pageContent.length < 1000) {
+        throw new Error('Page content too small, likely blank');
+      }
+      
+      // Try to find and screenshot the chart canvas specifically
+      const canvas = await page.$('canvas');
+      if (canvas) {
+        const boundingBox = await canvas.boundingBox();
+        if (boundingBox && boundingBox.width > 100 && boundingBox.height > 100) {
+          screenshot = await canvas.screenshot({ type: 'png' });
+        }
+      }
+      
+      // If canvas screenshot didn't work, try full viewport
+      if (!screenshot) {
+        screenshot = await page.screenshot({
+          type: 'png',
+          clip: { x: 0, y: 100, width: 1280, height: 600 } // Skip header, get chart area
+        });
+      }
+      
+      // Verify screenshot isn't blank
+      if (!screenshot || screenshot.length < 1000) {
+        throw new Error('Screenshot appears blank');
+      }
+    } catch (e) {
+      console.error('Screenshot attempt failed:', e.message);
+      // Final fallback - just screenshot the viewport
+      screenshot = await page.screenshot({ type: 'png', fullPage: false });
+    }
+    
+    await browser.close();
+    return screenshot;
+    
+  } catch (error) {
+    console.error('Chart screenshot error:', error.message);
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+    }
+    // Return null on error - bot will continue without screenshot
+    return null;
+  }
 }
 
 

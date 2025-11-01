@@ -1,84 +1,76 @@
-// Deeza v2 - Universal Smart Contract AI Agent
+// Deeza - Peer-to-Peer Gift Bot on Somnia
 import TelegramBot from 'node-telegram-bot-api';
 import { createClient } from '@supabase/supabase-js';
-import { ethers } from 'ethers';
-import CryptoJS from 'crypto-js';
 import OpenAI from 'openai';
+import { ethers } from 'ethers';
 import dotenv from 'dotenv';
-import { handleTokenQuery } from './support/tokenInfo.js';
-import { swapEthToToken, quoteEthToToken } from './support/swap.js';
+import { searchToken } from './support/tokenInfo.js';
+import { uploadToIPFS, fetchFromIPFS } from './support/lighthouse.js';
 dotenv.config();
 
 // Initialize
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { 
+  polling: {
+    interval: 1000,
+    autoStart: true,
+    params: {
+      timeout: 10
+    }
+  }
+});
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Network Config - MAINNET ONLY
-const SOMNIA_RPC = process.env.SOMNIA_RPC || 'https://somnia.publicnode.com';
-const SOMNIA_EXPLORER = 'https://explorer.somnia.network/';
-const SOMNIA_CHAIN_ID = parseInt(process.env.SOMNIA_CHAIN_ID || '50311'); // Somnia mainnet is 50311
+// Network Config
+const IS_TESTNET = process.env.IS_TESTNET === 'true' || process.env.NODE_ENV === 'test';
+const SOMNIA_RPC = process.env.SOMNIA_RPC || (IS_TESTNET ? 'https://dream-rpc.somnia.network' : 'https://somnia.publicnode.com');
+const SOMNIA_CHAIN_ID = parseInt(process.env.SOMNIA_CHAIN_ID || (IS_TESTNET ? '50312' : '50311'));
+const CONTRACT_ADDRESS = process.env.DEEZA_AGENT_CONTRACT; // Set in .env
+const WALLET_CONNECT_URL = 'https://deeza.vercel.app';
 
-// Log RPC being used (but don't expose sensitive URLs)
-console.log('Using RPC:', SOMNIA_RPC.includes('publicnode') ? 'somnia.publicnode.com (mainnet)' : SOMNIA_RPC.replace(/https?:\/\//, '').split('/')[0], '| Chain ID:', SOMNIA_CHAIN_ID);
+// Testnet: ZAZZ token (mock token for all ERC20 requests)
+const ZAZZ_TOKEN_ADDRESS = process.env.ZAZZ_TOKEN_ADDRESS || ethers.ZeroAddress; // Set after deployment
+const ZAZZ_MINT_AMOUNT = ethers.parseUnits('100000', 18); // 100k ZAZZ tokens for registration bonus
 
-// Create provider - force network to prevent auto-detection
+// Native token symbols
+const NATIVE_TOKEN = IS_TESTNET ? 'STT' : 'SOMI';
+
 const provider = new ethers.JsonRpcProvider(SOMNIA_RPC, {
   chainId: SOMNIA_CHAIN_ID,
   name: 'somnia'
 });
 
-// Completely disable network detection to prevent retries and testnet fallbacks
-provider._detectNetwork = async () => {
-  return { chainId: SOMNIA_CHAIN_ID, name: 'somnia' };
+// Contract ABI (minimal)
+const CONTRACT_ABI = [
+  'function createGift(bytes32 id, string calldata code, string calldata ipfsLink) external',
+  'function depositGift(bytes32 id, address token, uint256 amount) external payable',
+  'function release(bytes32 id, address to) external',
+  'function extendClaimTime(bytes32 id, uint256 minutes) external',
+  'function getGift(bytes32 id) external view returns (tuple(address gifter, address token, uint256 amount, string code, string ipfsLink, address claimer, uint256 claimDeadline, uint8 attempts, bool deposited, bool claimed))',
+  'event GiftCreated(bytes32 indexed id, address gifter, string code)',
+  'event GiftDeposited(bytes32 indexed id)',
+  'event GiftClaimed(bytes32 indexed id, address claimer, uint256 amount, address token)'
+];
+
+// ZAZZ Token ABI (for minting test tokens)
+const ZAZZ_ABI = [
+  'function mint(address to, uint256 amount) external',
+  'function balanceOf(address account) external view returns (uint256)'
+];
+
+const contract = CONTRACT_ADDRESS ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider) : null;
+const zazzContract = ZAZZ_TOKEN_ADDRESS && ZAZZ_TOKEN_ADDRESS !== ethers.ZeroAddress 
+  ? new ethers.Contract(ZAZZ_TOKEN_ADDRESS, ZAZZ_ABI, provider) 
+  : null;
+
+// Context types
+const CONTEXT_TYPES = {
+  REGISTER_WALLET: 'register_wallet',
+  REGISTER_WALLET_CONFIRM: 'register_wallet_confirm', // Confirmation for changing existing wallet
+  SEND_GIFT_PROOF: 'send_gift_proof',
+  SEND_GIFT_CONFIRM: 'send_gift_confirm',
+  CLAIM_GIFT: 'claim_gift'
 };
-
-// Router and WETH (WSOMI) for swaps
-const ROUTER_ADDRESS = '0xCdE9aFDca1AdAb5b5C6E4F9e16c9802C88Dc7e1A'; // SomniExchangerRouter02
-const WETH_ADDRESS = '0x046EDe9564A72571df6F5e44d0405360c0f4dCab';   // WSOMI
-
-// Minimal UniswapV2 Router ABI
-const ROUTER_ABI = [
-  'function WETH() view returns (address)',
-  'function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts)',
-  'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)'
-];
-
-// Contracts
-const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS;
-const SOMI_POOL_ADDRESS = '0x70d069acda32ce9a2e13cfbcbf33ba39bc151517f5133fa9cd0ecee8849a6129';
-const GECKOTERMINAL_API = `https://api.geckoterminal.com/api/v2/networks/eth/pools/${SOMI_POOL_ADDRESS}`;
-
-// ERC20 ABI
-const ERC20_ABI = [
-  'function balanceOf(address owner) view returns (uint256)',
-  'function transfer(address to, uint256 amount) returns (bool)',
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)',
-  'function name() view returns (string)',
-  'function mint() public',
-  'function timeUntilNextMint(address user) public view returns (uint256)'
-];
-
-// Encryption
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-function encrypt(text) {
-  return CryptoJS.AES.encrypt(text, ENCRYPTION_KEY).toString();
-}
-function decrypt(encryptedText) {
-  const bytes = CryptoJS.AES.decrypt(encryptedText, ENCRYPTION_KEY);
-  return bytes.toString(CryptoJS.enc.Utf8);
-}
-
-// Generate wallet
-function generateWallet() {
-  const wallet = ethers.Wallet.createRandom();
-  return {
-    address: wallet.address,
-    privateKey: wallet.privateKey,
-    encryptedKey: encrypt(wallet.privateKey)
-  };
-}
 
 // Get or create user
 async function getOrCreateUser(tgId, username) {
@@ -90,177 +82,86 @@ async function getOrCreateUser(tgId, username) {
 
   if (existingUser) return existingUser;
 
-  const wallet = generateWallet();
   const { data: newUser } = await supabase.from('deeza_users').insert({
     telegram_id: tgId,
     telegram_username: username,
-    wallet_address: wallet.address,
-    encrypted_private_key: wallet.encryptedKey,
-    tier: 'regular'
+    wallet_address: null
   }).select().single();
 
-  return { ...newUser, isNew: true, privateKey: wallet.privateKey };
+  return newUser;
 }
 
-// Conversation context management
-async function saveContext(tgId, contextType, contextData) {
-  await supabase.from('conversation_context').delete().eq('telegram_id', tgId); // Clear old context
-  
-  await supabase.from('conversation_context').insert({
+// Save context
+async function saveContext(tgId, type, data) {
+  await supabase.from('deeza_contexts').upsert({
     telegram_id: tgId,
-    context_type: contextType,
-    context_data: contextData,
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString() // 5 min expiry
+    context_type: type,
+    context_data: data,
+    updated_at: new Date().toISOString()
   });
 }
 
+// Get context
 async function getContext(tgId) {
   const { data } = await supabase
-    .from('conversation_context')
+    .from('deeza_contexts')
     .select('*')
     .eq('telegram_id', tgId)
-    .gt('expires_at', new Date().toISOString())
-    .order('created_at', { ascending: false })
-    .limit(1)
     .single();
-  
   return data;
 }
 
+// Clear context
 async function clearContext(tgId) {
-  await supabase.from('conversation_context').delete().eq('telegram_id', tgId);
+  await supabase.from('deeza_contexts').delete().eq('telegram_id', tgId);
 }
 
-// Get STT price
-async function getSTTPrice() {
-  try {
-    const response = await fetch(GECKOTERMINAL_API);
-    const data = await response.json();
-    return parseFloat(data.data.attributes.base_token_price_usd) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-// Get token price (for USD conversion)
-async function getTokenPrice(tokenSymbol) {
-  if (tokenSymbol === 'USDC') return 1; // USDC = $1
-  if (tokenSymbol === 'STT') return await getSTTPrice();
-  return 0;
-}
-
-// Convert USD to token amount
-async function convertUSDToToken(usdAmount, tokenSymbol) {
-  const price = await getTokenPrice(tokenSymbol);
-  if (price === 0) return null;
-  return usdAmount / price;
-}
-
-// Get balance for any token
-async function getBalance(address, tokenAddress = null) {
-  try {
-    if (!tokenAddress) {
-      const balance = await provider.getBalance(address);
-      return {
-        balance: ethers.formatEther(balance),
-        decimals: 18,
-        symbol: 'STT',
-        isNative: true
-      };
-    } else {
-      const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-      const [balance, decimals, symbol, name] = await Promise.all([
-        contract.balanceOf(address),
-        contract.decimals(),
-        contract.symbol().catch(() => 'UNKNOWN'),
-        contract.name().catch(() => 'Unknown Token')
-      ]);
-      return {
-        balance: ethers.formatUnits(balance, decimals),
-        decimals,
-        symbol,
-        name,
-        isNative: false
-      };
-    }
-  } catch (error) {
-    return null; // Token doesn't exist
-  }
-}
-
-// Check if username exists
-async function checkUserExists(username) {
+// Get user by username
+async function getUserByUsername(username) {
   const { data } = await supabase
     .from('deeza_users')
-    .select('wallet_address, telegram_username')
+    .select('*')
     .eq('telegram_username', username.toLowerCase())
     .single();
   return data;
 }
 
-// Get USDC mint cooldown
-async function getUSDCMintCooldown(address) {
+// AI Intent Parser
+async function processWithAI(userMessage, existingContext = null) {
   try {
-    const contract = new ethers.Contract(USDC_CONTRACT_ADDRESS, ERC20_ABI, provider);
-    const timeRemaining = await contract.timeUntilNextMint(address);
-    return Number(timeRemaining);
-  } catch {
-    return null;
-  }
-}
+    const systemPrompt = `You are Deeza — a chill, conversational, helpful "crypto bro" on Somnia. You help users send peer-to-peer gifts (USDC, ${NATIVE_TOKEN}, or any ERC-20 token) to friends using natural language. Your signature emoji is 😉.
 
-// Main GPT-4 Brain with context awareness
-async function processWithAI(userMessage, userData, userName, existingContext) {
-  try {
-    const sttBalance = await getBalance(userData.wallet_address) || { balance: '0', symbol: 'STT' };
-    const usdcBalance = await getBalance(userData.wallet_address, USDC_CONTRACT_ADDRESS) || { balance: '0', symbol: 'USDC' };
-    const sttPrice = await getSTTPrice();
-    const usdcCooldown = await getUSDCMintCooldown(userData.wallet_address);
-    
-    const sttUSD = parseFloat(sttBalance.balance || 0) * sttPrice;
-    const hasGas = parseFloat(sttBalance.balance || 0) > 0;
+SPECIAL RESPONSES:
+- If user asks about a "Deeza token": "Our developers haven't launched an official token yet, but if we did, we'd be sure it'd do a moon shot! 🚀😉"
+- If user asks about founder/developer/owner/creator/builder: "I was built by Dee, a 16 year old Nigerian developer — an amazing guy! Even named this crypto bro after himself 😉"
 
-    const contextInfo = existingContext ? `
-CONVERSATION CONTEXT (User is continuing from previous message):
-Type: ${existingContext.context_type}
-Data: ${JSON.stringify(existingContext.context_data)}
+ALWAYS return a single JSON response with keys: action, params, message. ONLY produce a single JSON object.
 
-If user provides a number/amount or clarification, complete the pending action!
-` : '';
+ACTIONS:
+1. REGISTER_WALLET: When user wants to register their wallet or says "register me", "connect wallet", etc.
+   - params: { "intent": "register" }
 
-    const systemPrompt = `You are Deeza — a chill, conversational, helpful "crypto bro." You help users with swaps, prices, market data, and sticking together in the crypto trenches. Your signature emoji is 😉. Use 😉 intentionally for confirmations or when you're being supportive. Sometimes, when users make cool moves (like a token send), react with 😁 in Telegram. Your vibe: "we trenches bro, stick together." Keep it real, minimal emojis, and always conversational.
+2. SEND_GIFT: When user wants to send a gift (e.g., "send @john 10 USDC", "send 5 ${NATIVE_TOKEN} to @mike", "send 100$ worth of NIA to @alice")
+   - Extract: recipient (username or @username), amount (number), token (USDC, ${NATIVE_TOKEN}, or token symbol)
+   - If amount is in USD (has $ or "usd"), set "amount_usd": number, else set "amount": number
+   - params: { "recipient": "john", "amount": 10, "token": "USDC" } OR { "recipient": "mike", "amount": 5, "token": "${NATIVE_TOKEN}" } OR { "recipient": "alice", "amount_usd": 100, "token": "NIA" }
 
-ALWAYS return a single JSON response with keys: action, params, message. DO NOT output just plain text or any extra description. ONLY produce a single JSON object, nothing else.
+3. SET_PROOF: When user answers what the receiver should prove (after send gift)
+   - params: { "proof": "answer text" }
 
-CAPABILITIES & ACTIONS:
-1. TOKEN INFORMATION QUERIES - Use these for ANY token-related questions:
-   - "fetch_price" or "fetchPrice" → When user asks for price (e.g., "what's SOMI price?", "price of PEPE")
-   - "fetch_marketcap" or "fetch_market_cap" or "fetchMarketcap" → When user asks for market cap (e.g., "jellu market cap", "what's the mcap of NIA")
-   - "fetch_volume" or "fetchVolume" → When user asks for volume (e.g., "24h volume of SOMI", "volume on PEPE")
-   - "fetch_liquidity" or "fetchLiquidity" → When user asks about liquidity
-   - "fetch_change" or "fetchChange" → When user asks about price change (e.g., "how much did PEPE change?", "24h change SOMI")
-   - "token_info" or "tokenInfo" → When user wants general info about a token (e.g., "tell me about SOMI", "info on PEPE", "show me jellu")
-   
-   All token queries use params: { "token": "SYMBOL" } or { "query": "SYMBOL" } (symbol is the token ticker like "SOMI", "PEPE", "JELLU")
+4. CLAIM_GIFT: When user wants to claim a gift (e.g., "claim john42", "claim code123")
+   - params: { "code": "john42" }
 
-2. WALLET ACTIONS:
-   - "wallet_info" → When user asks about their wallet (e.g., "what's my wallet?", "my address", "show my balance")
-   - "send_token" → When user wants to send tokens (e.g., "send 5 SOMI to 0x...", "send 10 USDC to @user")
-   - "send_usd" → When user wants to send USD value (e.g., "send $5 worth of SOMI")
-   - "balance_check" → When user checks balance of a specific token
+5. SHOW_GIFTS: When user wants to see their gifts ("show my gifts", "show pending", "show sent")
+   - params: { "type": "pending|active|all" }
 
-3. SWAPS:
-   - "swap_eth_to_token" → When user wants to swap SOMI for another token (e.g., "swap 1 SOMI to PEPE", "swap 0.5 usd somnia to xyz")
-
-4. GENERAL CHAT:
-   - "chat" → For general conversation that doesn't require actions
+6. CHAT: For general conversation
 
 EXAMPLES:
-User: "what's jellu price?" → {"action":"fetch_price","params":{"token":"jellu"},"message":"Checking JELLU price..."}
-User: "jellu market cap" → {"action":"fetch_marketcap","params":{"token":"jellu"},"message":"Fetching JELLU market cap..."}
-User: "what's the 24h volume on SOMI?" → {"action":"fetch_volume","params":{"token":"SOMI"},"message":"Getting SOMI volume..."}
-User: "show me info on PEPE" → {"action":"token_info","params":{"token":"PEPE"},"message":"Fetching PEPE info..."}
-User: "what's my wallet address?" → {"action":"wallet_info","params":{},"message":"Let me check your wallet..."}
+User: "should I register you?" → {"action":"register_wallet","params":{"intent":"register"},"message":"Sure! What's your wallet address? 😉"}
+User: "send @john 10 USDC" → {"action":"send_gift","params":{"recipient":"john","amount":10,"token":"USDC"},"message":"What should @john prove?"}
+User: "his dog's name is Luna" → {"action":"set_proof","params":{"proof":"his dog's name is Luna"},"message":"Got it! Code: john42 — OK?"}
+User: "claim john42" → {"action":"claim_gift","params":{"code":"john42"},"message":"What's your dog's name?"}
 
 RESPONSE FORMAT (JSON):
 {
@@ -270,12 +171,21 @@ RESPONSE FORMAT (JSON):
 }
 `;
 
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage }
+    ];
+
+    if (existingContext) {
+      messages.splice(1, 0, {
+        role: "assistant",
+        content: `Context: User is in ${existingContext.context_type} flow.`
+      });
+    }
+
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage }
-      ],
+      messages,
       temperature: 0.4,
       max_tokens: 500
     });
@@ -284,7 +194,6 @@ RESPONSE FORMAT (JSON):
     console.log('AI RAW RESPONSE:', response);
     const jsonMatch = response.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error('AI responded without parseable JSON:', response); // extra debug log
       return {
         action: 'chat',
         params: {},
@@ -293,7 +202,6 @@ RESPONSE FORMAT (JSON):
     }
     
     return JSON.parse(jsonMatch[0]);
-
   } catch (error) {
     console.error('AI processing error:', error);
     return {
@@ -304,231 +212,146 @@ RESPONSE FORMAT (JSON):
   }
 }
 
-// Execute blockchain action
-async function executeAction(action, params, userData, tgId) {
+// AI Judge - Check if answer matches expected
+async function judgeAnswer(userAnswer, expectedAnswer) {
   try {
-    const privateKey = decrypt(userData.encrypted_private_key);
-    const wallet = new ethers.Wallet(privateKey, provider);
+    const prompt = `You are an AI judge. Check if the user's answer matches the expected answer.
 
-    // Handle USD-based sends
-    if (action === 'send_usd') {
-      const tokenAmount = await convertUSDToToken(params.usd_amount, params.token_symbol);
-      if (!tokenAmount) {
-        return { success: false, message: `Couldn't get price for ${params.token_symbol}` };
-      }
+Expected answer: "${expectedAnswer}"
+User's answer: "${userAnswer}"
 
-      // Check user exists
-      if (!params.recipient.startsWith('0x')) {
-        const cleanUsername = params.recipient.replace('@', '').toLowerCase();
-        const target = await checkUserExists(cleanUsername);
-        if (!target) {
-          return {
-            success: false,
-            message: `@${cleanUsername} hasn't set up their wallet yet! Invite them to message me.`
-          };
-        }
-      }
+Respond with ONLY a JSON object:
+{
+  "correct": true/false,
+  "reason": "brief explanation"
+}
 
-      // Check balance
-      const balance = await getBalance(userData.wallet_address, params.token_address);
-      if (parseFloat(balance.balance) < tokenAmount) {
-        return {
-          success: false,
-          message: `You need ${tokenAmount.toFixed(4)} ${params.token_symbol} but only have ${balance.balance}!`
-        };
-      }
+Be flexible - if the user's answer clearly means the same thing as expected, mark it correct.`;
 
-      // Convert to regular send
-      params.amount = tokenAmount;
-      action = 'send_token';
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        { role: "system", content: "You are an AI judge. Respond with JSON only." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 200
+    });
+
+    const response = completion.choices[0].message.content.trim();
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
     }
-
-    // Handle token sends
-    if (action === 'send_token') {
-      let targetAddress;
-      if (params.recipient.startsWith('0x')) {
-        targetAddress = params.recipient;
-      } else {
-        const cleanUsername = params.recipient.replace('@', '').toLowerCase();
-        const target = await checkUserExists(cleanUsername);
-        if (!target) {
-          return {
-            success: false,
-            message: `@${cleanUsername} hasn't set up their wallet yet! Invite them to message me.`
-          };
-        }
-        targetAddress = target.wallet_address;
-      }
-
-      let tx;
-      if (params.token_symbol === 'STT' && !params.token_address) {
-        tx = await wallet.sendTransaction({
-          to: targetAddress,
-          value: ethers.parseEther(params.amount.toString())
-        });
-      } else {
-        const tokenAddr = params.token_address || USDC_CONTRACT_ADDRESS;
-        const contract = new ethers.Contract(tokenAddr, ERC20_ABI, wallet);
-        const decimals = await contract.decimals();
-        tx = await contract.transfer(targetAddress, ethers.parseUnits(params.amount.toString(), decimals));
-      }
-
-      await tx.wait();
-      await clearContext(tgId); // Clear context after successful send
-
-      const recipientDisplay = params.recipient.startsWith('0x')
-        ? `${params.recipient.slice(0, 6)}...${params.recipient.slice(-4)}`
-        : `@${params.recipient.replace('@', '')}`;
-      let confirmationMessage = `Sent ${params.amount} ${params.token_symbol} to ${recipientDisplay}! We stick together in these trenches 😉\n\nView: ${SOMNIA_EXPLORER}tx/${tx.hash}`;
-
-      // Telegram Reaction + Quoting
-      if (params._telegram_chat_id && params._telegram_message_id) {
-        try {
-          await bot.setMessageReaction(params._telegram_chat_id, params._telegram_message_id, {
-            reaction: [{ type: 'emoji', emoji: '😁' }]
-          });
-        } catch(err) {
-          console.error('Reaction error:', err.response?.body || err);
-        }
-        return {
-          success: true,
-          message: confirmationMessage,
-          quote_to_message_id: params._telegram_message_id
-        };
-      }
-      return {
-        success: true,
-        message: confirmationMessage
-      };
-    }
-
-    // Handle ETH -> Token swap (SOMI -> Token)
-    if (action === 'swap_eth_to_token') {
-      const privateKey = decrypt(userData.encrypted_private_key);
-      return await swapEthToToken(params, { ...userData, privateKey }, provider);
-    }
-
-    // Handle balance checks
-    if (action === 'balance_check') {
-      if (params.token_address) {
-        const tokenInfo = await getBalance(userData.wallet_address, params.token_address);
-        if (!tokenInfo) {
-          return {
-            success: false,
-            message: `That token doesn't exist on Somnia! Want to check a different address?`
-          };
-        }
-        return {
-          success: true,
-          message: `${tokenInfo.name} (${tokenInfo.symbol})\n\nBalance: ${parseFloat(tokenInfo.balance).toFixed(4)} ${tokenInfo.symbol}\n\nContract: ${params.token_address}`
-        };
-      } else {
-        const sttBalance = await getBalance(userData.wallet_address) || { balance: '0', symbol: 'STT' };
-        const usdcBalance = await getBalance(userData.wallet_address, USDC_CONTRACT_ADDRESS) || { balance: '0', symbol: 'USDC' };
-        const sttPrice = await getSTTPrice();
-        const sttUSD = parseFloat(sttBalance.balance || 0) * sttPrice;
-
-        return {
-          success: true,
-          message: `💰 Your Wallet! 🔥\n\n📍 ${userData.wallet_address}\n\n💵 Balances:\n• STT: ${parseFloat(sttBalance.balance || 0).toFixed(4)} (~$${sttUSD.toFixed(2)})\n• USDC: ${parseFloat(usdcBalance.balance || 0).toFixed(2)}\n\n💲 STT Price: $${sttPrice.toFixed(4)}\n📊 Total: ~$${(sttUSD + parseFloat(usdcBalance.balance || 0)).toFixed(2)}\n\n🔍 ${SOMNIA_EXPLORER}address/${userData.wallet_address}`
-        };
-      }
-    }
-
-    // Handle user lookup
-    if (action === 'lookup_user') {
-      const cleanUsername = params.username_to_check.replace('@', '').toLowerCase();
-      const user = await checkUserExists(cleanUsername);
-      if (user) {
-        return {
-          success: true,
-          message: `Yes, @${cleanUsername} is registered!\n\nWallet: ${user.wallet_address}`
-        };
-      } else {
-        return {
-          success: false,
-          message: `@${cleanUsername} hasn't set up their wallet yet. They can message me to get started!`
-        };
-      }
-    }
-
-    // Handle mint USDC
-    if (action === 'mint_usdc') {
-      const contract = new ethers.Contract(USDC_CONTRACT_ADDRESS, ERC20_ABI, wallet);
-      const tx = await contract.mint();
-      await tx.wait();
-
-      const newBalance = await getBalance(userData.wallet_address, USDC_CONTRACT_ADDRESS);
-
-      return {
-        success: true,
-        message: `USDC Minted!\n\nYou received 200 USDC\nNew Balance: ${newBalance.balance} USDC\n\nNext mint in 24h\n\nView: ${SOMNIA_EXPLORER}tx/${tx.hash}`
-      };
-    }
-
-    // Handle token queries
-    if (action === 'token_query') {
-      const response = await handleTokenQuery(params, provider);
-      return {
-        success: true,
-        message: response
-      };
-    }
-
-    // Handle wallet info
-    if (action === 'wallet_info') {
-      const sttBalance = await getBalance(userData.wallet_address) || { balance: '0', symbol: 'STT' };
-      const usdcBalance = await getBalance(userData.wallet_address, USDC_CONTRACT_ADDRESS) || { balance: '0', symbol: 'USDC' };
-      const sttPrice = await getSTTPrice();
-      const sttUSD = parseFloat(sttBalance.balance || 0) * sttPrice;
-
-      return {
-        success: true,
-        message: `💰 Your Wallet on Somnia! 🔥\n\n📍 Address:\n${userData.wallet_address}\n\n💵 Balances:\n• STT: ${parseFloat(sttBalance.balance || 0).toFixed(4)} (~$${sttUSD.toFixed(2)})\n• USDC: ${parseFloat(usdcBalance.balance || 0).toFixed(2)}\n\n💲 STT Price: $${sttPrice.toFixed(4)}\n📊 Total Value: ~$${(sttUSD + parseFloat(usdcBalance.balance || 0)).toFixed(2)}\n\n🔍 View: ${SOMNIA_EXPLORER}address/${userData.wallet_address}`
-      };
-    }
-
-    return { success: true, message: null };
-
+    return { correct: false, reason: "Failed to parse response" };
   } catch (error) {
-    console.error('Execute action error:', error);
-    let errorMsg = 'Transaction Failed\n\n';
-
-    if (error.message.includes('insufficient funds')) {
-      errorMsg += 'You don\'t have enough tokens or gas.\n\nYou need STT (native token) for gas fees! 💸';
-    } else if (error.message.includes('account does not exist')) {
-      errorMsg += 'Your wallet needs STT for gas!\n\nGet some STT to get started! 💰';
-    } else {
-      errorMsg += error.message;
-    }
-
-    return { success: false, message: errorMsg };
+    console.error('AI judge error:', error);
+    return { correct: false, reason: "Error judging answer" };
   }
 }
 
-// Handle /help and /start
+// Resolve token address (testnet uses ZAZZ mock token, mainnet uses real addresses)
+async function getTokenAddress(tokenSymbol) {
+  const tokenUpper = tokenSymbol?.toUpperCase() || '';
+  
+  // Native token check
+  if (!tokenSymbol || tokenUpper === 'SOMI' || tokenUpper === 'STT') {
+    return ethers.ZeroAddress; // Native token (STT on testnet, SOMI on mainnet)
+  }
+
+  // Testnet: All ERC20 tokens use ZAZZ mock token
+  if (IS_TESTNET) {
+    if (!ZAZZ_TOKEN_ADDRESS || ZAZZ_TOKEN_ADDRESS === ethers.ZeroAddress) {
+      console.warn('ZAZZ_TOKEN_ADDRESS not set - cannot resolve testnet token');
+      return null;
+    }
+    return ZAZZ_TOKEN_ADDRESS;
+  }
+
+  // Mainnet: Fetch real token address from GeckoTerminal
+  try {
+    const tokenInfo = await searchToken(tokenSymbol);
+    return tokenInfo?.tokenAddress || null;
+  } catch (error) {
+    console.error('Token search error:', error);
+    return null;
+  }
+}
+
+// Convert USD amount to token amount
+async function convertUSDToTokens(tokenSymbol, usdAmount) {
+  const tokenUpper = tokenSymbol?.toUpperCase() || '';
+  const nativeTokenSymbol = IS_TESTNET ? 'STT' : 'SOMI';
+  
+  if (tokenUpper === 'SOMI' || tokenUpper === 'STT' || tokenUpper === nativeTokenSymbol) {
+    // Get native token price
+    const tokenInfo = await searchToken(nativeTokenSymbol);
+    if (!tokenInfo?.poolAddress) return null;
+    const poolRes = await fetch(`https://api.geckoterminal.com/api/v2/networks/somnia/pools/${tokenInfo.poolAddress}`);
+    const poolData = await poolRes.json();
+    const price = parseFloat(poolData?.data?.attributes?.base_token_price_usd || 0);
+    if (price === 0) return null;
+    return usdAmount / price;
+  } else {
+    // Get token price (real token on mainnet, ZAZZ on testnet for calculation)
+    const searchSymbol = IS_TESTNET ? 'ZAZZ' : tokenSymbol;
+    const tokenInfo = await searchToken(searchSymbol);
+    if (!tokenInfo?.poolAddress) return null;
+    const poolRes = await fetch(`https://api.geckoterminal.com/api/v2/networks/somnia/pools/${tokenInfo.poolAddress}`);
+    const poolData = await poolRes.json();
+    const price = parseFloat(poolData?.data?.attributes?.base_token_price_usd || 0);
+    if (price === 0) return null;
+    return usdAmount / price;
+  }
+}
+
+// Send registration bonus (100k ZAZZ tokens on testnet only)
+async function sendRegistrationBonus(walletAddress) {
+  if (!IS_TESTNET) return; // Only on testnet
+  
+  if (!ZAZZ_TOKEN_ADDRESS || ZAZZ_TOKEN_ADDRESS === ethers.ZeroAddress) {
+    console.warn('ZAZZ_TOKEN_ADDRESS not set - cannot send registration bonus');
+    return;
+  }
+
+  if (!process.env.BOT_PRIVATE_KEY) {
+    console.warn('BOT_PRIVATE_KEY not set - cannot send registration bonus');
+    return;
+  }
+
+  try {
+    const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+    const zazzWithSigner = zazzContract.connect(botWallet);
+    
+    // Mint 100k ZAZZ tokens to the new user
+    const tx = await zazzWithSigner.mint(walletAddress, ZAZZ_MINT_AMOUNT);
+    await tx.wait();
+    
+    console.log(`✅ Registration bonus sent: 100k ZAZZ to ${walletAddress}`);
+    return true;
+  } catch (error) {
+    console.error('Registration bonus error:', error);
+    return false;
+  }
+}
+
+// Handle /start
 bot.onText(/\/(help|start)/, async (msg) => {
   const tgId = msg.from.id;
   const username = msg.from.username?.toLowerCase() || msg.from.first_name;
 
   try {
-    const user = await getOrCreateUser(tgId, username);
-
-    if (user.isNew) {
-      await bot.sendMessage(msg.chat.id, `Hey there! I'm Deeza — your very own crypto bro on Somnia. 😎\n\nYour wallet is ready:\n${user.wallet_address}\n\nI can help you:\n• Send tokens\n• Place limit orders\n• Perform swaps & bridges\n• Launch tokens seamlessly with Deeza\n• Check token info/prices & compare coins\n\nDo it all without leaving your DMs — and get it on somnia.meme 😉`, { disable_web_page_preview: true });
-
-      setTimeout(() => {
-        bot.sendMessage(msg.chat.id, `🔐 Your Private Key\n\n${user.privateKey}\n\n⚠️ Save this securely — it's your master key!`, { disable_web_page_preview: true });
-      }, 1000);
-
-      return;
-    }
-
-    bot.sendMessage(msg.chat.id, `Hey there! I'm Deeza — your crypto bro. 😎\n\nI can help you with:\n💰 Send tokens naturally — "send $5 of STT to @alice"\n🌀 Perform swaps & bridges\n🚀 Launch tokens seamlessly with Deeza\n📊 Check token prices — "What's SOMI price?"\n💧 Ask about liquidity — "Show me STT's liquidity"\n📈 Compare tokens — "Compare SOMI vs PEPE"\n\nAll without leaving your DMs — get it on somnia.meme 😉`);
-
+    await getOrCreateUser(tgId, username);
+    
+    const networkInfo = IS_TESTNET 
+      ? `🧪 TESTNET MODE\n• Native: STT\n• All tokens use ZAZZ (mock token)\n• Register wallet = 100k ZAZZ bonus! 🎁`
+      : `🌐 MAINNET\n• Native: SOMI\n• Real token addresses`;
+    
+    const helpText = `Hey there! I'm Deeza — your crypto bro for peer-to-peer gifts on Somnia. 😎\n\n${networkInfo}\n\n📝 How it works:\n1. Send gifts: "send @john 10 USDC" or "send $20 worth of NIA to @mike"\n2. Set proof: Tell me what they should prove (e.g., "his dog's name is Luna")\n3. They claim: Receiver says "claim [code]" and answers your question\n4. AI judges: I check if their answer matches!\n\n💡 Examples:\n• "send @friend 5 ${NATIVE_TOKEN}"\n• "send 3000 NIA to @alice"\n• "send $100 JELLU to @bob"\n\nThey claim by proving what you ask! 😉`;
+    
+    await bot.sendMessage(msg.chat.id, helpText);
   } catch (error) {
-    console.error('Help error:', error);
-    bot.sendMessage(msg.chat.id, 'Something went wrong!');
+    console.error('Start error:', error);
   }
 });
 
@@ -539,97 +362,385 @@ bot.on('message', async (msg) => {
 
   const tgId = msg.from.id;
   const username = msg.from.username?.toLowerCase() || msg.from.first_name;
-  const firstName = msg.from.first_name || 'there';
 
   try {
-    // Show typing while we process
     await bot.sendChatAction(msg.chat.id, 'typing');
-
     const user = await getOrCreateUser(tgId, username);
-
-    // Removed: new-user welcome here. Only /start shows welcome & keys.
-
-    // Check for existing context
     const existingContext = await getContext(tgId);
 
-    // Quick confirm handler: if we have a pending swap and user says yes/sure/confirm
-    if (existingContext && existingContext.context_type === 'pending_action' && existingContext.context_data?.action === 'swap_eth_to_token') {
-      const text = (msg.text || '').toLowerCase().trim();
-      if (/^(y|yes|sure|confirm|do it|go|ok)$/i.test(text)) {
-        await bot.sendMessage(msg.chat.id, '...deezaing this', { reply_to_message_id: msg.message_id });
-        await bot.sendChatAction(msg.chat.id, 'typing');
-        const result = await executeAction('swap_eth_to_token', existingContext.context_data.params, user, tgId);
+    // Handle wallet registration follow-ups
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.REGISTER_WALLET) {
+      const text = msg.text.trim();
+      // Check if it's a wallet address
+      if (text.startsWith('0x') && text.length === 42) {
+        // Check if user already has a wallet
+        const { data: existingUser } = await supabase
+          .from('deeza_users')
+          .select('wallet_address')
+          .eq('telegram_id', tgId)
+          .single();
+        
+        const isNewRegistration = !existingUser?.wallet_address;
+        
+        // If user already has a wallet, ask for confirmation
+        if (!isNewRegistration && existingUser.wallet_address) {
+          const oldAddress = existingUser.wallet_address;
+          await saveContext(tgId, CONTEXT_TYPES.REGISTER_WALLET_CONFIRM, {
+            newAddress: text,
+            oldAddress: oldAddress
+          });
+          await bot.sendMessage(msg.chat.id, `⚠️ You already have a wallet registered:\n${oldAddress.substring(0, 10)}...${oldAddress.substring(38)}\n\nNew address: ${text.substring(0, 10)}...${text.substring(38)}\n\nDo you want to change it? (yes/no)`, { reply_to_message_id: msg.message_id });
+          return;
+        }
+        
+        // New registration - proceed directly
+        await supabase.from('deeza_users').update({
+          wallet_address: text
+        }).eq('telegram_id', tgId);
+        
         await clearContext(tgId);
-        if (result.message) {
-          await bot.sendMessage(msg.chat.id, result.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
+        
+        // Send registration bonus on testnet (only for new registrations)
+        if (isNewRegistration && IS_TESTNET) {
+          const bonusSent = await sendRegistrationBonus(text);
+          if (bonusSent) {
+            await bot.sendMessage(msg.chat.id, `✅ Wallet registered! ${text.substring(0, 10)}...${text.substring(38)}\n\n🎁 You received 100,000 ZAZZ tokens to play with! (Testnet only)`, { reply_to_message_id: msg.message_id });
+          } else {
+            await bot.sendMessage(msg.chat.id, `✅ Wallet registered! ${text.substring(0, 10)}...${text.substring(38)}\n\n⚠️ Bonus failed to send (check bot config)`, { reply_to_message_id: msg.message_id });
+          }
+        } else {
+          await bot.sendMessage(msg.chat.id, `✅ Wallet registered! ${text.substring(0, 10)}...${text.substring(38)}`, { reply_to_message_id: msg.message_id });
         }
         return;
-      } else if (/^(n|no|cancel|stop)$/i.test(text)) {
+      } else {
+        // Continue asking
+        await bot.sendMessage(msg.chat.id, "Please provide a valid wallet address (starts with 0x, 42 characters). 😉", { reply_to_message_id: msg.message_id });
+        return;
+      }
+    }
+
+    // Handle wallet change confirmation
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.REGISTER_WALLET_CONFIRM) {
+      const text = msg.text.toLowerCase().trim();
+      const confirmWords = ['yes', 'yep', 'ok', 'okay', 'sure', 'confirm', 'go', 'change'];
+      const cancelWords = ['no', 'cancel', 'abort', 'stop'];
+      
+      if (confirmWords.some(word => text.includes(word))) {
+        const { newAddress, oldAddress } = existingContext.context_data;
+        
+        // Update wallet address
+        await supabase.from('deeza_users').update({
+          wallet_address: newAddress
+        }).eq('telegram_id', tgId);
+        
         await clearContext(tgId);
-        await bot.sendMessage(msg.chat.id, 'Cancelled. No swap executed.');
+        await bot.sendMessage(msg.chat.id, `✅ Wallet address updated!\n\nOld: ${oldAddress.substring(0, 10)}...${oldAddress.substring(38)}\nNew: ${newAddress.substring(0, 10)}...${newAddress.substring(38)}`, { reply_to_message_id: msg.message_id });
+        return;
+      } else if (cancelWords.some(word => text.includes(word))) {
+        await clearContext(tgId);
+        await bot.sendMessage(msg.chat.id, "Cancelled. Wallet address not changed.", { reply_to_message_id: msg.message_id });
+        return;
+      } else {
+        // Not clear - ask again
+        await bot.sendMessage(msg.chat.id, "Please confirm: say 'yes' to change or 'no' to cancel.", { reply_to_message_id: msg.message_id });
+        return;
+      }
+    }
+
+    // Handle proof setting follow-up
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.SEND_GIFT_PROOF) {
+      const aiResponse = await processWithAI(msg.text, existingContext);
+      if (aiResponse.action === 'set_proof' && aiResponse.params?.proof) {
+        const proof = aiResponse.params.proof;
+        const giftData = existingContext.context_data;
+        
+        // Generate code
+        const code = `${giftData.recipient}${Math.floor(Math.random() * 100)}`;
+        const giftId = ethers.id(code);
+        
+        // Upload Q&A to IPFS
+        const ipfsData = {
+          question: `What should ${giftData.recipient} prove?`,
+          answer: proof,
+          gifter: user.telegram_username,
+          recipient: giftData.recipient
+        };
+        
+        let ipfsLink = '';
+        try {
+          ipfsLink = await uploadToIPFS(ipfsData);
+        } catch (error) {
+          console.error('IPFS upload error:', error);
+          await bot.sendMessage(msg.chat.id, "Error uploading proof. Try again.", { reply_to_message_id: msg.message_id });
+          return;
+        }
+
+        // Store gift in Supabase and context
+        const giftIdHex = ethers.hexlify(giftId);
+        
+        await supabase.from('deeza_gifts').insert({
+          gift_id: giftIdHex,
+          code,
+          gifter_telegram_id: tgId,
+          recipient_username: giftData.recipient,
+          token: giftData.token,
+          token_address: giftData.tokenAddress || ethers.ZeroAddress,
+          amount: giftData.amount.toString(),
+          ipfs_link: ipfsLink
+        });
+
+        // Create gift on contract (if deployed)
+        if (contract && process.env.BOT_PRIVATE_KEY) {
+          try {
+            const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+            const contractWithSigner = contract.connect(botWallet);
+            await contractWithSigner.createGift(giftId, code, ipfsLink);
+          } catch (error) {
+            console.error('Contract create error:', error);
+          }
+        }
+
+        await saveContext(tgId, CONTEXT_TYPES.SEND_GIFT_CONFIRM, {
+          ...giftData,
+          code,
+          giftId: giftIdHex,
+          ipfsLink,
+          proof
+        });
+
+        const displayTokenName = giftData.token.toUpperCase() === 'SOMI' || giftData.token.toUpperCase() === 'STT' ? NATIVE_TOKEN : giftData.token.toUpperCase();
+        const depositLink = `${WALLET_CONNECT_URL}?gift=${code}&token=${displayTokenName}&amount=${giftData.amount}&tokenAddress=${giftData.tokenAddress || '0x0000000000000000000000000000000000000000'}`;
+        
+        const testnetNote = IS_TESTNET ? '\n\n🧪 Testnet: All ERC20 tokens use ZAZZ mock token' : '';
+        await bot.sendMessage(msg.chat.id, `Code: ${code} — OK?${testnetNote}\n\nDeposit link: ${depositLink}`, { reply_to_message_id: msg.message_id });
+        return;
+      }
+    }
+
+    // Handle gift confirmation
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.SEND_GIFT_CONFIRM) {
+      const text = msg.text.toLowerCase().trim();
+      const confirmWords = ['yes', 'yep', 'ok', 'okay', 'sure', 'confirm', 'go'];
+      
+      if (confirmWords.some(word => text.includes(word))) {
+        const giftData = existingContext.context_data;
+        await clearContext(tgId);
+        
+        // Notify recipient if they're registered
+        const recipient = await getUserByUsername(giftData.recipient);
+        if (recipient && recipient.wallet_address) {
+          try {
+            await bot.sendMessage(recipient.telegram_id, `🎁 You received a gift from @${user.telegram_username}!\n\nSay "claim ${giftData.code}" to unlock it. 😉`);
+          } catch (e) {
+            console.error('DM error:', e);
+          }
+        }
+        
+        await bot.sendMessage(msg.chat.id, `✅ Gift created! Code: ${giftData.code}\n\nRecipient can claim with: "claim ${giftData.code}"`, { reply_to_message_id: msg.message_id });
+        return;
+      } else if (text.includes('no') || text.includes('cancel')) {
+        await clearContext(tgId);
+        await bot.sendMessage(msg.chat.id, "Cancelled. No gift created.", { reply_to_message_id: msg.message_id });
         return;
       }
     }
 
     // Process with AI
-    const aiResponse = await processWithAI(msg.text, user, firstName, existingContext);
+    const aiResponse = await processWithAI(msg.text, existingContext);
 
+    // Emoji reaction
     try { await bot.setMessageReaction(msg.chat.id, msg.message_id, { reaction: [{ type: 'emoji', emoji: '😁' }] }); } catch {}
 
-    if (aiResponse.action === 'save_context') {
-      await saveContext(tgId, 'pending_action', aiResponse.params.context_data);
-    }
-
-    // Normalize actions (handle both snake_case and camelCase)
-    const actionAliases = { 'get_wallet_address':'wallet_info','getWalletAddress':'wallet_info','get_balance':'wallet_info','getBalance':'wallet_info','get_wallet_balance':'wallet_info','getWalletBalance':'wallet_info','show_wallet':'wallet_info','showWallet':'wallet_info','check_my_wallet':'wallet_info','checkMyWallet':'wallet_info','check_my_balance':'wallet_info','checkMyBalance':'wallet_info','swap':'swap_eth_to_token','swap_somi':'swap_eth_to_token','swap_eth_to_token':'swap_eth_to_token' };
-    const metricMap = { 'fetch_marketcap':'mcap','fetch_market_cap':'mcap','fetchMarketcap':'mcap','fetchMarketCap':'mcap','fetch_price':'price','fetchPrice':'price','fetch_liquidity':'liquidity','fetchLiquidity':'liquidity','fetch_volume':'volume','fetchVolume':'volume','fetch_change':'change','fetchChange':'change','token_info':null,'tokenInfo':null };
-    
-    if (aiResponse.action && actionAliases[aiResponse.action]) {
-      aiResponse.action = actionAliases[aiResponse.action];
-    } else if (aiResponse.action && metricMap.hasOwnProperty(aiResponse.action)) {
-      aiResponse.params = aiResponse.params || {};
-      const tokenSymbol = aiResponse.params.token || aiResponse.params.symbol || aiResponse.params.query;
-      // Get metric BEFORE changing action
-      const mm = metricMap[aiResponse.action];
-      aiResponse.action = 'token_query';
-      aiResponse.params.tokens = tokenSymbol ? [tokenSymbol] : (aiResponse.params.tokens || []);
-      if (mm) aiResponse.params.metric = mm;
-      if ((aiResponse.params.metric === 'volume' || aiResponse.params.metric === 'change') && !aiResponse.params.timeframe) aiResponse.params.timeframe = '24h';
-    }
-
-    if (['send_token'].includes(aiResponse.action)) {
-      aiResponse.params = aiResponse.params || {};
-      aiResponse.params._telegram_chat_id = msg.chat.id;
-      aiResponse.params._telegram_message_id = msg.message_id;
-    }
-
+    // Send AI message
     if (aiResponse.message) {
       await bot.sendMessage(msg.chat.id, aiResponse.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
     }
 
-    // Execution actions
-    const executionActions = ['send_token','send_usd','mint_usdc','token_query','wallet_info','balance_check','swap_eth_to_token'];
-
-    // For swaps, do quote + save context first, require confirmation
-    if (aiResponse.action === 'swap_eth_to_token') {
-      const privateKey = decrypt(user.encrypted_private_key);
-      const quote = await quoteEthToToken(aiResponse.params, { ...user, privateKey }, provider);
-      if (!quote.success) {
-        await bot.sendMessage(msg.chat.id, quote.message, { reply_to_message_id: msg.message_id });
-        return;
-      }
-      await bot.sendMessage(msg.chat.id, quote.message, { reply_to_message_id: msg.message_id });
-      await saveContext(tgId, 'pending_action', { action: 'swap_eth_to_token', params: aiResponse.params });
+    // Handle actions
+    if (aiResponse.action === 'register_wallet' || (aiResponse.action === 'chat' && msg.text.toLowerCase().includes('register'))) {
+      await saveContext(tgId, CONTEXT_TYPES.REGISTER_WALLET, {});
+      await bot.sendMessage(msg.chat.id, "Okay cool, what's your wallet address? 😉", { reply_to_message_id: msg.message_id });
       return;
     }
 
-    if (executionActions.includes(aiResponse.action)) {
-      await bot.sendMessage(msg.chat.id, '...deezaing this', { reply_to_message_id: msg.message_id });
-      await bot.sendChatAction(msg.chat.id, 'typing');
-      const result = await executeAction(aiResponse.action, aiResponse.params, user, tgId);
-      if (result.message) {
-        await bot.sendMessage(msg.chat.id, result.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
+    if (aiResponse.action === 'send_gift') {
+      const params = aiResponse.params;
+      const recipient = params.recipient?.replace('@', '');
+      let amount = params.amount || 0;
+      let token = params.token || 'USDC';
+      let tokenAddress = null;
+
+      // Handle USD amounts
+      if (params.amount_usd) {
+        const tokenAmount = await convertUSDToTokens(token, params.amount_usd);
+        if (!tokenAmount) {
+          await bot.sendMessage(msg.chat.id, `Couldn't get price for ${token}. Try again.`, { reply_to_message_id: msg.message_id });
+          return;
+        }
+        amount = tokenAmount;
       }
+
+      // Get token address
+      if (token.toUpperCase() !== 'SOMI') {
+        tokenAddress = await getTokenAddress(token);
+        if (!tokenAddress) {
+          await bot.sendMessage(msg.chat.id, `Couldn't find token ${token}. Make sure the symbol is correct.`, { reply_to_message_id: msg.message_id });
+          return;
+        }
+      }
+
+      if (!recipient || !amount || amount <= 0) {
+        await bot.sendMessage(msg.chat.id, "I need a recipient and amount! Try: \"send @john 10 USDC\" 😉", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      // Check if gifter has wallet
+      if (!user.wallet_address) {
+        await bot.sendMessage(msg.chat.id, `You need to register your wallet first! Say "register me" or "should I register you?" 😉`, { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      // Normalize token symbol for display (show requested token name, but use correct address)
+      const displayToken = token.toUpperCase();
+      const resolvedToken = displayToken === 'SOMI' || displayToken === 'STT' ? NATIVE_TOKEN : displayToken;
+
+      await saveContext(tgId, CONTEXT_TYPES.SEND_GIFT_PROOF, {
+        recipient,
+        amount,
+        token,
+        tokenAddress
+      });
+
+      await bot.sendMessage(msg.chat.id, `What should @${recipient} prove?`, { reply_to_message_id: msg.message_id });
+      return;
+    }
+
+    if (aiResponse.action === 'claim_gift') {
+      const code = aiResponse.params?.code;
+      if (!code) {
+        await bot.sendMessage(msg.chat.id, "I need a gift code! Try: \"claim john42\" 😉", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      // Check if user has wallet
+      if (!user.wallet_address) {
+        await bot.sendMessage(msg.chat.id, "You need to register your wallet first! Say \"register me\" 😉", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      // Get gift from Supabase
+      const { data: giftRecord } = await supabase
+        .from('deeza_gifts')
+        .select('*')
+        .eq('code', code)
+        .single();
+
+      if (!giftRecord) {
+        await bot.sendMessage(msg.chat.id, "Gift not found. Make sure the code is correct.", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      if (giftRecord.claimed) {
+        await bot.sendMessage(msg.chat.id, "This gift has already been claimed.", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      if (!giftRecord.deposited) {
+        await bot.sendMessage(msg.chat.id, "Gift not deposited yet. Wait for the gifter to deposit.", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      // Get from contract if available, otherwise use Supabase data
+      let giftData = null;
+      if (contract) {
+        try {
+          const giftId = ethers.id(code);
+          const gift = await contract.getGift(giftId);
+          if (gift.deposited && !gift.claimed) {
+            giftData = gift;
+          }
+        } catch (error) {
+          console.error('Contract fetch error:', error);
+        }
+      }
+
+      // Fetch Q&A from IPFS
+      try {
+        const ipfsData = await fetchFromIPFS(giftRecord.ipfs_link);
+        
+        await saveContext(tgId, CONTEXT_TYPES.CLAIM_GIFT, {
+          giftId: giftRecord.gift_id,
+          code,
+          expectedAnswer: ipfsData.answer,
+          question: ipfsData.question,
+          attempts: 0,
+          tokenAddress: giftRecord.token_address,
+          amount: giftRecord.amount
+        });
+
+        await bot.sendMessage(msg.chat.id, ipfsData.question || "What's the proof?", { reply_to_message_id: msg.message_id });
+      } catch (error) {
+        console.error('IPFS fetch error:', error);
+        await bot.sendMessage(msg.chat.id, "Error fetching gift details. Try again.", { reply_to_message_id: msg.message_id });
+      }
+      return;
+    }
+
+    // Handle claim answer
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.CLAIM_GIFT) {
+      const userAnswer = msg.text;
+      const claimData = existingContext.context_data;
+      
+      // Judge answer
+      const judgment = await judgeAnswer(userAnswer, claimData.expectedAnswer);
+      
+      if (judgment.correct) {
+        // Release gift
+        if (contract) {
+          try {
+            // Bot wallet would sign this - needs bot private key
+            // For MVP, assume bot wallet is set up
+            const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+            const contractWithSigner = contract.connect(botWallet);
+            await contractWithSigner.release(claimData.giftId, user.wallet_address || ethers.ZeroAddress);
+            
+            await clearContext(tgId);
+            await bot.sendMessage(msg.chat.id, `✅ Correct! Gift claimed and sent! 🎉`, { reply_to_message_id: msg.message_id });
+          } catch (error) {
+            console.error('Release error:', error);
+            await bot.sendMessage(msg.chat.id, "Error releasing gift. Contact support.", { reply_to_message_id: msg.message_id });
+          }
+        } else {
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, `✅ Correct! (Contract not deployed yet)`, { reply_to_message_id: msg.message_id });
+        }
+      } else {
+        let attempts = (claimData.attempts || 0) + 1;
+        
+        if (attempts >= 3) {
+          // Extend claim time
+          if (contract) {
+            try {
+              const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+              const contractWithSigner = contract.connect(botWallet);
+              await contractWithSigner.extendClaimTime(claimData.giftId, 30);
+            } catch (e) {
+              console.error('Extend error:', e);
+            }
+          }
+          
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, `❌ Wrong. Locked for 30 minutes. Try again later.`, { reply_to_message_id: msg.message_id });
+        } else {
+          await saveContext(tgId, CONTEXT_TYPES.CLAIM_GIFT, {
+            ...claimData,
+            attempts
+          });
+          
+          await bot.sendMessage(msg.chat.id, `❌ Wrong. Try again. (${3 - attempts} attempts left)`, { reply_to_message_id: msg.message_id });
+        }
+      }
+      return;
     }
 
   } catch (error) {
@@ -639,12 +750,20 @@ bot.on('message', async (msg) => {
 });
 
 // Error handling
-bot.on('polling_error', (error) => console.error('Polling:', error));
+bot.on('polling_error', (error) => {
+  console.error('Polling error:', error.message || error);
+});
 bot.on('error', (error) => console.error('Bot:', error));
 
 // Launch
-console.log('Deeza - AI Crypto Bro 🔥');
-console.log('Features: Token queries, Wallet management, USD sends, Follow-ups');
+console.log('Deeza - Gift Drop Bot 🔥');
+console.log(`Network: ${IS_TESTNET ? 'TESTNET' : 'MAINNET'}`);
+console.log(`Native Token: ${NATIVE_TOKEN}`);
+if (IS_TESTNET) {
+  console.log(`ZAZZ Token: ${ZAZZ_TOKEN_ADDRESS || 'NOT SET'}`);
+  console.log('Registration bonus: 100k ZAZZ tokens 🎁');
+}
+console.log('Features: Peer-to-peer gifts, AI-gated claims');
 console.log('Ready!');
 
 process.once('SIGINT', () => bot.stopPolling().then(() => process.exit(0)));

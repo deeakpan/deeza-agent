@@ -12,6 +12,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@lighthouse-web3/sdk": "^0.4.3",
     "@openzeppelin/contracts": "^5.4.0",
     "@supabase/supabase-js": "^2.76.1",
     "@types/node-telegram-bot-api": "^0.64.11",
@@ -20,8 +21,10 @@
     "ethers": "^6.15.0",
     "node-telegram-bot-api": "^0.66.0",
     "openai": "^4.28.0",
+    "puppeteer": "^24.27.0",
     "telegraf": "^4.16.3",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "uuid": "^13.0.0"
   },
   "type": "module",
   "devDependencies": {
