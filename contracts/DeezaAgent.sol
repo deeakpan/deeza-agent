@@ -9,11 +9,12 @@ contract DeezaAgent is Ownable {
     uint256 public defaultLockTime = 30 minutes;
 
     struct Gift {
-        address gifter;
-        address token;          // 0x0 = SOMI (native), else ERC-20
-        uint256 amount;
+        address gifter;         // Set when user deposits
+        address recipient;      // Set by bot when creating
+        address token;          // Set by bot when creating
+        uint256 amount;         // Set by bot when creating
         string code;
-        string ipfsLink;        // Q&A stored on Lighthouse
+        string ipfsLink;
         address claimer;
         uint256 claimDeadline;
         uint8 attempts;
@@ -22,12 +23,9 @@ contract DeezaAgent is Ownable {
     }
 
     mapping(bytes32 => Gift) public gifts;
-    mapping(address => bytes32[]) public pendingGifts;
-    mapping(address => bytes32[]) public activeGifts;
-    mapping(address => bytes32[]) public claimedGifts;
 
-    event GiftCreated(bytes32 indexed id, address gifter, string code);
-    event GiftDeposited(bytes32 indexed id);
+    event GiftCreated(bytes32 indexed id, address recipient, address token, uint256 amount, string code);
+    event GiftDeposited(bytes32 indexed id, address gifter);
     event GiftClaimed(bytes32 indexed id, address claimer, uint256 amount, address token);
     event ClaimTimeExtended(bytes32 indexed id, uint256 newDeadline);
 
@@ -44,18 +42,24 @@ contract DeezaAgent is Ownable {
         bot = _bot;
     }
 
-    // Create gift (called by bot after AI processing)
+    // Bot creates gift WITH recipient, token and amount
     function createGift(
         bytes32 id,
         string calldata code,
-        string calldata ipfsLink
+        string calldata ipfsLink,
+        address recipient,
+        address token,
+        uint256 amount
     ) external onlyBot {
-        require(gifts[id].gifter == address(0), "Gift exists");
+        require(gifts[id].amount == 0, "Gift exists");
+        require(amount > 0, "Amount must be > 0");
+        require(recipient != address(0), "Invalid recipient");
         
         gifts[id] = Gift({
-            gifter: address(0),
-            token: address(0),
-            amount: 0,
+            gifter: address(0),     // Will be set when user deposits
+            recipient: recipient,   // Set now by bot
+            token: token,           // Set now by bot
+            amount: amount,         // Set now by bot
             code: code,
             ipfsLink: ipfsLink,
             claimer: address(0),
@@ -65,64 +69,48 @@ contract DeezaAgent is Ownable {
             claimed: false
         });
 
-        emit GiftCreated(id, address(0), code);
+        emit GiftCreated(id, recipient, token, amount, code);
     }
 
-    // Called by gifter after wallet connect
-    function depositGift(
-        bytes32 id,
-        address token,
-        uint256 amount
-    ) external payable {
+    // User deposits the exact amount specified in the gift
+    function depositGift(bytes32 id) external payable {
         Gift storage g = gifts[id];
-        require(g.gifter == address(0) || !g.deposited, "Already deposited");
-        require(bytes(g.code).length > 0, "Gift not created");
+        require(g.amount > 0, "Gift not created");
+        require(!g.deposited, "Already deposited");
 
-        if (token == address(0)) {
-            require(msg.value == amount, "Wrong SOMI amount");
+        if (g.token == address(0)) {
+            // Native token (STT/SOMI)
+            require(msg.value == g.amount, "Wrong amount");
         } else {
-            IERC20(token).transferFrom(msg.sender, address(this), amount);
+            // ERC20 token
+            require(msg.value == 0, "No ETH for ERC20");
+            IERC20(g.token).transferFrom(msg.sender, address(this), g.amount);
         }
 
-        // If first deposit, set gifter
-        if (g.gifter == address(0)) {
-            g.gifter = msg.sender;
-            pendingGifts[msg.sender].push(id);
-        }
-
-        g.token = token;
-        g.amount = amount;
+        g.gifter = msg.sender;
         g.deposited = true;
         g.claimDeadline = block.timestamp + defaultLockTime;
 
-        _removeFromArray(pendingGifts[msg.sender], id);
-        if (!_existsInArray(activeGifts[msg.sender], id)) {
-            activeGifts[msg.sender].push(id);
-        }
-
-        emit GiftDeposited(id);
+        emit GiftDeposited(id, msg.sender);
     }
 
-    // Bot pays after AI approves
-    function release(bytes32 id, address to) external onlyBot {
+    // Bot releases to the recipient stored in the gift
+    function release(bytes32 id) external onlyBot {
         Gift storage g = gifts[id];
         require(g.deposited && !g.claimed, "Invalid state");
         require(block.timestamp <= g.claimDeadline, "Expired");
+        require(g.recipient != address(0), "No recipient");
 
         g.claimed = true;
-        g.claimer = to;
-
-        if (!_existsInArray(claimedGifts[to], id)) {
-            claimedGifts[to].push(id);
-        }
+        g.claimer = g.recipient;
 
         if (g.token == address(0)) {
-            payable(to).transfer(g.amount);
+            payable(g.recipient).transfer(g.amount);
         } else {
-            IERC20(g.token).transfer(to, g.amount);
+            IERC20(g.token).transfer(g.recipient, g.amount);
         }
 
-        emit GiftClaimed(id, to, g.amount, g.token);
+        emit GiftClaimed(id, g.recipient, g.amount, g.token);
     }
 
     // Bot extends on 3 wrong answers
@@ -137,38 +125,6 @@ contract DeezaAgent is Ownable {
     // Get gift info
     function getGift(bytes32 id) external view returns (Gift memory) {
         return gifts[id];
-    }
-
-    // Get user's gifts
-    function getPendingGifts(address user) external view returns (bytes32[] memory) {
-        return pendingGifts[user];
-    }
-
-    function getActiveGifts(address user) external view returns (bytes32[] memory) {
-        return activeGifts[user];
-    }
-
-    function getClaimedGifts(address user) external view returns (bytes32[] memory) {
-        return claimedGifts[user];
-    }
-
-    function _removeFromArray(bytes32[] storage arr, bytes32 id) internal {
-        for (uint i = 0; i < arr.length; i++) {
-            if (arr[i] == id) {
-                arr[i] = arr[arr.length - 1];
-                arr.pop();
-                break;
-            }
-        }
-    }
-
-    function _existsInArray(bytes32[] storage arr, bytes32 id) internal view returns (bool) {
-        for (uint i = 0; i < arr.length; i++) {
-            if (arr[i] == id) {
-                return true;
-            }
-        }
-        return false;
     }
 
     // Emergency withdraw (owner only)

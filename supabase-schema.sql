@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS deeza_gifts (
   gifter_telegram_id BIGINT NOT NULL,
   recipient_username TEXT,
   recipient_telegram_id BIGINT,
+  recipient_wallet TEXT, -- Recipient's wallet address (required for contract release)
   token TEXT, -- Token symbol (e.g., "USDC", "ZAZZ", "NIA")
   token_address TEXT, -- Contract address (0x0 for native)
   amount TEXT, -- Amount as string (to handle large numbers)
