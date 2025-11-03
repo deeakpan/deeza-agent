@@ -225,4 +225,4 @@ const tokenAmount = await convertUSDToToken(10, 'STT');
 
 ---
 
-**Now you have a universal AI agent that can interact with ANY smart contract!** 🚀
+**Now you have a universal AI agent that can interact with ANY smart contract!** 
