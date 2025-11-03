@@ -89,7 +89,8 @@ contract DeezaAgent is Ownable {
 
         g.gifter = msg.sender;
         g.deposited = true;
-        g.claimDeadline = block.timestamp + defaultLockTime;
+        // claimDeadline remains 0 = no lockout (claimable immediately)
+        // Only set claimDeadline (lockout period) when wrong answers occur (via extendClaimTime)
 
         emit GiftDeposited(id, msg.sender);
     }
@@ -98,7 +99,10 @@ contract DeezaAgent is Ownable {
     function release(bytes32 id) external onlyBot {
         Gift storage g = gifts[id];
         require(g.deposited && !g.claimed, "Invalid state");
-        require(block.timestamp <= g.claimDeadline, "Expired");
+        // claimDeadline = 0 means no lockout (claimable immediately)
+        // claimDeadline > block.timestamp means still locked out (can't claim yet)
+        // claimDeadline <= block.timestamp means lockout period over (can claim)
+        require(g.claimDeadline == 0 || block.timestamp >= g.claimDeadline, "Locked");
         require(g.recipient != address(0), "No recipient");
 
         g.claimed = true;
@@ -113,10 +117,12 @@ contract DeezaAgent is Ownable {
         emit GiftClaimed(id, g.recipient, g.amount, g.token);
     }
 
-    // Bot extends on 3 wrong answers
+    // Bot sets lockout period after 3 wrong answers
+    // claimDeadline = time after which user can claim again (lockout end time)
     function extendClaimTime(bytes32 id, uint256 minutesToAdd) external onlyBot {
         Gift storage g = gifts[id];
         require(g.deposited && !g.claimed, "Invalid state");
+        // Set claimDeadline to future time = lockout until that time
         g.claimDeadline = block.timestamp + (minutesToAdd * 1 minutes);
         g.attempts = 0;
         emit ClaimTimeExtended(id, g.claimDeadline);

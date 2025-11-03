@@ -132,6 +132,23 @@ async function saveContext(tgId, type, data) {
   console.log(`[saveContext] ✅ Saved context for ${tgId}: ${type}`);
 }
 
+// Retry helper for blockchain calls
+async function retryBlockchainCall(fn, maxAttempts = 3, delayMs = 2000) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      console.log(`[RETRY] Attempt ${attempt}/${maxAttempts} failed:`, error.message);
+      if (attempt < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // Get context
 async function getContext(tgId) {
   const { data, error } = await supabase
@@ -271,10 +288,33 @@ RESPONSE FORMAT (JSON):
 // AI Judge - Check if answer matches expected
 async function judgeAnswer(userAnswer, expectedAnswer) {
   try {
+    // First, do a simple case-insensitive exact match
+    const userLower = userAnswer.trim().toLowerCase();
+    const expectedLower = expectedAnswer.trim().toLowerCase();
+    
+    if (userLower === expectedLower) {
+      console.log(`[JUDGE] Expected: "${expectedAnswer}", Got: "${userAnswer}" → ✅ Exact match (simple)`);
+      return { correct: true, reason: "Exact match" };
+    }
+    
+    // Also check if user's answer contains the expected answer or vice versa (for flexibility)
+    if (userLower.includes(expectedLower) || expectedLower.includes(userLower)) {
+      console.log(`[JUDGE] Expected: "${expectedAnswer}", Got: "${userAnswer}" → ✅ Partial match (simple)`);
+      return { correct: true, reason: "Partial match" };
+    }
+    
+    // If simple match fails, use AI for semantic matching
     const prompt = `You are an AI judge. Check if the user's answer matches the expected answer.
 
 Expected answer: "${expectedAnswer}"
 User's answer: "${userAnswer}"
+
+CRITICAL: You MUST be VERY FLEXIBLE:
+- Ignore capitalization (charles = Charles = CHARLES)
+- Ignore extra spaces or punctuation
+- If the user's answer clearly refers to the same thing, mark it correct
+- Partial matches are acceptable (e.g., "charles" matches "his name is charles")
+- Common variations should be accepted (nicknames, abbreviations)
 
 Respond with ONLY a JSON object:
 {
@@ -282,22 +322,28 @@ Respond with ONLY a JSON object:
   "reason": "brief explanation"
 }
 
-Be flexible - if the user's answer clearly means the same thing as expected, mark it correct.`;
+Examples:
+- Expected: "charles", User: "Charles" → CORRECT
+- Expected: "charles", User: "CHARLES" → CORRECT
+- Expected: "his name is charles", User: "charles" → CORRECT
+- Expected: "charles", User: "it's charles" → CORRECT`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [
-        { role: "system", content: "You are an AI judge. Respond with JSON only." },
+        { role: "system", content: "You are a VERY FLEXIBLE AI judge. Be lenient with matching. Respond with JSON only." },
         { role: "user", content: prompt }
       ],
-      temperature: 0.2,
+      temperature: 0.3,
       max_tokens: 200
     });
 
     const response = completion.choices[0].message.content.trim();
     const jsonMatch = response.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+      const result = JSON.parse(jsonMatch[0]);
+      console.log(`[JUDGE] Expected: "${expectedAnswer}", Got: "${userAnswer}" → ${result.correct ? '✅' : '❌'} (${result.reason})`);
+      return result;
     }
     return { correct: false, reason: "Failed to parse response" };
   } catch (error) {
@@ -358,7 +404,9 @@ async function convertUSDToTokens(tokenSymbol, usdAmount) {
 // Get wallet balance
 async function getWalletBalance(walletAddress) {
   try {
-    const balanceHex = await provider.send('eth_getBalance', [walletAddress, 'latest']);
+    const balanceHex = await retryBlockchainCall(async () => {
+      return await provider.send('eth_getBalance', [walletAddress, 'latest']);
+    });
     const nativeBalance = BigInt(balanceHex);
     const sttBalance = ethers.formatEther(nativeBalance);
 
@@ -366,7 +414,9 @@ async function getWalletBalance(walletAddress) {
     if (IS_TESTNET && ZAZZ_TOKEN_ADDRESS && ZAZZ_TOKEN_ADDRESS !== ethers.ZeroAddress) {
       const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
       const zazzContract = new ethers.Contract(ZAZZ_TOKEN_ADDRESS, ERC20_ABI, provider);
-      const zazzBal = await zazzContract.balanceOf(walletAddress);
+      const zazzBal = await retryBlockchainCall(async () => {
+        return await zazzContract.balanceOf(walletAddress);
+      });
       zazzBalance = ethers.formatEther(zazzBal);
     }
 
@@ -395,8 +445,11 @@ async function sendRegistrationBonus(walletAddress) {
     const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
     const zazzWithSigner = zazzContract.connect(botWallet);
     
-    const tx = await zazzWithSigner.mint(walletAddress, ZAZZ_MINT_AMOUNT);
-    await tx.wait();
+    const tx = await retryBlockchainCall(async () => {
+      const tx = await zazzWithSigner.mint(walletAddress, ZAZZ_MINT_AMOUNT);
+      await tx.wait();
+      return tx;
+    });
     
     console.log(`✅ Registration bonus sent: 100k ZAZZ to ${walletAddress}`);
     return true;
@@ -613,17 +666,58 @@ bot.on('message', async (msg) => {
       
       const giftData = existingContext.context_data;
       
-      // Single proof only - no loop!
+      // Single proof only
       const proofs = [proofText];
       
       // Generate code based on recipient username
       const baseCode = giftData.recipient.toLowerCase();
       const code = `${baseCode}${Math.floor(Math.random() * 100)}`;
       
+      // Use AI to convert proof statement to a proper question with "you/your"
+      console.log(`[GIFT_PROOF] Generating question from: "${proofText}"`);
+      let question = proofText;
+      let expectedAnswer = proofText;
+      
+      try {
+        const aiPrompt = `Convert this proof statement into a direct question for the recipient (use "you/your"):
+
+Proof: "${proofText}"
+
+Examples:
+"That his mother's name is patience" → Question: "What is your mother's name?" Answer: "patience"
+"Their favorite color is red" → Question: "What is your favorite color?" Answer: "red"
+"He was born in 1990" → Question: "What year were you born?" Answer: "1990"
+"She lives in Lagos" → Question: "Where do you live?" Answer: "lagos"
+
+Return ONLY JSON:
+{"question": "...", "answer": "..."}`;
+
+        const aiResponse = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: [
+            { role: "system", content: "Convert proof statements to direct questions using 'you/your'. Return JSON only." },
+            { role: "user", content: aiPrompt }
+          ],
+          temperature: 0.2,
+          max_tokens: 100
+        });
+
+        const response = aiResponse.choices[0].message.content.trim();
+        const jsonMatch = response.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          question = parsed.question || proofText;
+          expectedAnswer = parsed.answer?.toLowerCase() || proofText;
+          console.log(`[GIFT_PROOF] Q: "${question}", A: "${expectedAnswer}"`);
+        }
+      } catch (error) {
+        console.error('[GIFT_PROOF] AI error:', error);
+      }
+      
       // Upload Q&A to IPFS
       const ipfsData = {
-        question: `What should ${giftData.recipient} prove?`,
-        answer: proofText,
+        question: question,
+        answer: expectedAnswer,
         proofs: proofs,
         gifter: user.telegram_username,
         recipient: giftData.recipient
@@ -657,7 +751,6 @@ bot.on('message', async (msg) => {
 
       // Build comprehensive confirmation message
       const displayTokenName = giftData.token.toUpperCase() === 'SOMI' || giftData.token.toUpperCase() === 'STT' ? NATIVE_TOKEN : giftData.token.toUpperCase();
-      const depositLink = `${WALLET_CONNECT_URL}?gift=${code}&token=${displayTokenName}&amount=${giftData.amount}&tokenAddress=${giftData.tokenAddress || '0x0000000000000000000000000000000000000000'}`;
       
       // Format recipient info (show address if provided, or username)
       let recipientInfo = `@${giftData.recipient}`;
@@ -679,11 +772,8 @@ bot.on('message', async (msg) => {
 
 **Recipient:** ${recipientInfo}
 **Amount:** ${giftData.amount} ${displayTokenName}
-**Proof Required:** ${proofText}
+**Proof Required:** ${question}
 **Gift Code:** \`${code}\`${testnetNote}
-
-💰 **Next Step:** Deposit your crypto
-${depositLink}
 
 Shall I create this gift? (yes/no)`;
       
@@ -695,10 +785,71 @@ Shall I create this gift? (yes/no)`;
     // Handle gift confirmation
     if (existingContext && existingContext.context_type === CONTEXT_TYPES.SEND_GIFT_CONFIRM) {
       const text = msg.text.toLowerCase().trim();
-      const confirmWords = ['yes', 'yep', 'ok', 'okay', 'sure', 'confirm', 'go', 'create', 'proceed', 'do it'];
-      const cancelWords = ['no', 'nah', 'cancel', 'abort', 'stop', 'dont'];
+      let shouldCreateGift = false;
       
-      if (confirmWords.some(word => text === word || text.includes(word))) {
+      // Use AI to judge if it's a confirmation or cancellation
+      const confirmPrompt = `Is this a confirmation or cancellation?
+      
+User said: "${msg.text}"
+
+Respond with ONLY JSON:
+{
+  "isConfirm": true/false,
+  "isCancel": true/false
+}
+
+A confirmation means: yes, sure, okay, ok, go ahead, create it, proceed, do it, let's go, yep, yeah, confirm, etc.
+A cancellation means: no, cancel, abort, stop, don't, nah, nope, nevermind, etc.
+Be flexible - understand natural language variations.`;
+
+      try {
+        const confirmCompletion = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: [
+            { role: "system", content: "You judge if user messages are confirmations or cancellations. Respond with JSON only." },
+            { role: "user", content: confirmPrompt }
+          ],
+          temperature: 0.2,
+          max_tokens: 100
+        });
+
+        const confirmResponse = confirmCompletion.choices[0].message.content.trim();
+        const confirmJsonMatch = confirmResponse.match(/\{[\s\S]*\}/);
+        
+        if (confirmJsonMatch) {
+          const confirmResult = JSON.parse(confirmJsonMatch[0]);
+          
+          if (confirmResult.isCancel) {
+            await clearContext(tgId);
+            await bot.sendMessage(msg.chat.id, "❌ Gift creation cancelled. No worries! 😉", { reply_to_message_id: msg.message_id });
+            return;
+          }
+          
+          if (confirmResult.isConfirm) {
+            shouldCreateGift = true;
+          }
+        }
+      } catch (confirmError) {
+        console.error('Confirmation AI error:', confirmError);
+      }
+      
+      // Fallback to simple check if AI fails or wasn't used
+      if (!shouldCreateGift) {
+        const confirmWords = ['yes', 'yep', 'ok', 'okay', 'sure', 'confirm', 'go', 'create', 'proceed', 'do it', 'yeah', 'alright', 'fine', 'sounds good'];
+        const cancelWords = ['no', 'nah', 'cancel', 'abort', 'stop', 'dont', 'nope', 'nevermind'];
+        
+        if (cancelWords.some(word => text === word || text.startsWith(word))) {
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, "❌ Gift creation cancelled. No worries! 😉", { reply_to_message_id: msg.message_id });
+          return;
+        }
+        
+        if (confirmWords.some(word => text === word || text.includes(word))) {
+          shouldCreateGift = true;
+        }
+      }
+      
+      if (shouldCreateGift) {
         const giftData = existingContext.context_data;
         
         // Create gift on contract ONLY (no Supabase!)
@@ -723,33 +874,21 @@ Shall I create this gift? (yes/no)`;
             console.log(`[GIFT_CREATE] Recipient: ${recipientAddress}`);
             console.log(`[GIFT_CREATE] Token: ${tokenAddress}, Amount: ${amountInWei.toString()}`);
             
-            // Retry logic for RPC issues
-            let tx;
-            let attempts = 0;
-            const maxAttempts = 3;
+            // Use retry helper for blockchain calls
+            const tx = await retryBlockchainCall(async () => {
+              const tx = await contractWithSigner.createGift(
+                giftId, 
+                giftData.code, 
+                giftData.ipfsLink,
+                recipientAddress,
+                tokenAddress,
+                amountInWei
+              );
+              await tx.wait();
+              return tx;
+            });
             
-            while (attempts < maxAttempts) {
-              try {
-                tx = await contractWithSigner.createGift(
-                  giftId, 
-                  giftData.code, 
-                  giftData.ipfsLink,
-                  recipientAddress,
-                  tokenAddress,
-                  amountInWei
-                );
-                await tx.wait();
-                console.log(`[GIFT_CREATE] ✅ Gift created on contract! Tx: ${tx.hash}`);
-                break;
-              } catch (retryError) {
-                attempts++;
-                if (attempts >= maxAttempts) {
-                  throw retryError;
-                }
-                console.log(`[GIFT_CREATE] Attempt ${attempts} failed, retrying...`);
-                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s before retry
-              }
-            }
+            console.log(`[GIFT_CREATE] ✅ Gift created on contract! Tx: ${tx.hash}`);
           } catch (error) {
             console.error('Contract create error:', error);
             await bot.sendMessage(msg.chat.id, `⚠️ RPC timeout - Somnia network is slow right now.\n\nYour gift data is saved! Try again in a moment with: "yes"`, { reply_to_message_id: msg.message_id });
@@ -796,12 +935,8 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
 
 **Next Step:** Paste your code on the deposit page to send the funds!`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
         return;
-      } else if (cancelWords.some(word => text === word || text.startsWith(word))) {
-        await clearContext(tgId);
-        await bot.sendMessage(msg.chat.id, "❌ Gift creation cancelled. No worries! 😉", { reply_to_message_id: msg.message_id });
-        return;
       } else {
-        await bot.sendMessage(msg.chat.id, "Please confirm: say **'yes'** to create the gift or **'no'** to cancel. 😉", { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+        await bot.sendMessage(msg.chat.id, "I didn't catch that. Say **'yes'** to create the gift or **'no'** to cancel. 😉", { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
         return;
       }
     }
@@ -831,22 +966,168 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
       }
     }
 
-    // Re-check context
+    // Handle claim answer FIRST (before AI processing)
+    // Re-check context for claim answers
     const currentContext = await getContext(tgId);
-    if (currentContext && currentContext.context_type !== CONTEXT_TYPES.CLAIM_GIFT) {
-      // If we have context (except CLAIM_GIFT), we've already handled it above
-      // Don't process with AI
+    if (currentContext && currentContext.context_type === CONTEXT_TYPES.CLAIM_GIFT) {
+      const userAnswer = msg.text;
+      const claimData = currentContext.context_data;
+      
+      // Check for cancel/exit commands
+      const textLower = userAnswer.toLowerCase().trim();
+      if (textLower === 'cancel' || textLower === 'cancel this' || textLower === 'stop' || textLower === 'reset') {
+        await clearContext(tgId);
+        await bot.sendMessage(msg.chat.id, `✅ Cancelled gift claim. All state reset! 😉\n\nWhat would you like to do now?`, { reply_to_message_id: msg.message_id });
+        return;
+      }
+      
+      console.log(`[CLAIM_ANSWER] Processing answer: "${userAnswer}" for code: ${claimData?.code || 'unknown'}`);
+      console.log(`[CLAIM_ANSWER] Expected answers:`, claimData?.expectedAnswers || [claimData?.expectedAnswer]);
+      
+      const expectedAnswers = claimData?.expectedAnswers || (claimData?.expectedAnswer ? [claimData.expectedAnswer] : []).filter(Boolean);
+      
+      if (!expectedAnswers || expectedAnswers.length === 0) {
+        await clearContext(tgId);
+        await bot.sendMessage(msg.chat.id, `⚠️ Error: No expected answers found. Please try claiming again.`, { reply_to_message_id: msg.message_id });
+        return;
+      }
+      
+      let judgment = { correct: false, reason: "No match" };
+      
+      console.log(`[CLAIM_ANSWER] Checking against ${expectedAnswers.length} expected answer(s)...`);
+      for (const expected of expectedAnswers) {
+        const testJudgment = await judgeAnswer(userAnswer, expected);
+        console.log(`[CLAIM_ANSWER] Judgment result:`, testJudgment);
+        if (testJudgment.correct) {
+          judgment = testJudgment;
+          break;
+        }
+      }
+      
+      console.log(`[CLAIM_ANSWER] Final judgment:`, judgment);
+      
+      if (judgment.correct) {
+        let recipientWallet = claimData.recipientWallet;
+        if (!recipientWallet) {
+          const { data: giftRecord } = await supabase
+            .from('deeza_gifts')
+            .select('recipient_wallet')
+            .eq('code', claimData.code)
+            .single();
+          recipientWallet = giftRecord?.recipient_wallet || user.wallet_address;
+        }
+
+        if (!recipientWallet) {
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, `⚠️ Error: Recipient wallet not found. Contact support.`, { reply_to_message_id: msg.message_id });
+          return;
+        }
+
+        if (user.wallet_address && recipientWallet.toLowerCase() !== user.wallet_address.toLowerCase()) {
+          await bot.sendMessage(msg.chat.id, `⚠️ This gift is for a different wallet address. You're claiming from ${user.wallet_address.substring(0, 10)}... but gift is for ${recipientWallet.substring(0, 10)}...`, { reply_to_message_id: msg.message_id });
+          await clearContext(tgId);
+          return;
+        }
+
+        if (contract) {
+          try {
+            const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+            const contractWithSigner = contract.connect(botWallet);
+            
+            console.log(`[CLAIM] Releasing gift ${claimData.code}`);
+            
+            // Check if gift is already claimed before attempting release
+            const giftCheck = await retryBlockchainCall(async () => {
+              return await contract.getGift(claimData.giftId);
+            });
+            
+            if (giftCheck.claimed) {
+              await clearContext(tgId);
+              await bot.sendMessage(msg.chat.id, `⚠️ This gift has already been claimed! Someone beat you to it. 😅`, { reply_to_message_id: msg.message_id });
+              return;
+            }
+            
+            const tx = await retryBlockchainCall(async () => {
+              const tx = await contractWithSigner.release(claimData.giftId);
+              await tx.wait();
+              return tx;
+            });
+            
+            console.log(`[CLAIM] ✅ Gift released! Tx: ${tx.hash}`);
+            
+            await clearContext(tgId);
+            await bot.sendMessage(msg.chat.id, `🎉 **BOOM! Correct answer!** Gift claimed successfully! 🚀\n\nTx: ${tx.hash}`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+          } catch (error) {
+            console.error('Release error:', error);
+            
+            // Check if gift is locked out
+            if (error.reason === 'Locked' || error.message?.includes('Locked')) {
+              await clearContext(tgId);
+              await bot.sendMessage(msg.chat.id, `🔒 Oops! You're still locked out from wrong answers. Wait a bit and try again later! 😉`, { reply_to_message_id: msg.message_id });
+            } else if (error.reason === 'Only bot' || error.message?.includes('Only bot')) {
+              await clearContext(tgId);
+              await bot.sendMessage(msg.chat.id, `⚠️ Bot configuration error. Contact support.`, { reply_to_message_id: msg.message_id });
+            } else {
+              await bot.sendMessage(msg.chat.id, `😕 Error releasing gift: ${error.message || error.reason || 'Unknown error'}. Try again in a moment!`, { reply_to_message_id: msg.message_id });
+            }
+          }
+        } else {
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, `✅ Correct! (Contract not deployed yet)`, { reply_to_message_id: msg.message_id });
+        }
+      } else {
+        let attempts = (claimData.attempts || 0) + 1;
+        
+        if (attempts >= 3) {
+          if (contract) {
+            try {
+              const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
+              const contractWithSigner = contract.connect(botWallet);
+              
+              await retryBlockchainCall(async () => {
+                const tx = await contractWithSigner.extendClaimTime(claimData.giftId, 30);
+                await tx.wait();
+                return tx;
+              });
+            } catch (e) {
+              console.error('Extend error:', e);
+            }
+          }
+          
+          await clearContext(tgId);
+          await bot.sendMessage(msg.chat.id, `😅 Oops! Wrong answer 3 times. Locked for 30 minutes - give it another shot later! 😉`, { reply_to_message_id: msg.message_id });
+        } else {
+          await saveContext(tgId, CONTEXT_TYPES.CLAIM_GIFT, {
+            ...claimData,
+            attempts
+          });
+          
+          const attemptsLeft = 3 - attempts;
+          const friendlyMessages = [
+            `😏 Nice try! But nope, that's not quite right. ${attemptsLeft} more attempt${attemptsLeft > 1 ? 's' : ''} left - you got this! 💪`,
+            `🤔 Hmm, not quite right! ${attemptsLeft} more attempt${attemptsLeft > 1 ? 's' : ''} remaining. Think harder! 🧠`,
+            `😄 Almost there but not quite! ${attemptsLeft} more attempt${attemptsLeft > 1 ? 's' : ''} left. Keep going! 🚀`
+          ];
+          const randomMsg = friendlyMessages[Math.floor(Math.random() * friendlyMessages.length)];
+          await bot.sendMessage(msg.chat.id, randomMsg, { reply_to_message_id: msg.message_id });
+        }
+      }
       return;
     }
 
-    // Process with AI
-    const aiResponse = await processWithAI(msg.text, currentContext);
+    // If we have other context, we've already handled it above
+    if (currentContext && currentContext.context_type !== CONTEXT_TYPES.CLAIM_GIFT) {
+      return;
+    }
 
-    // Emoji reaction
-    try { await bot.setMessageReaction(msg.chat.id, msg.message_id, { reaction: [{ type: 'emoji', emoji: '😁' }] }); } catch {}
+    // Process with AI only if not in CLAIM_GIFT context
+    var aiResponse = await processWithAI(msg.text, currentContext);
 
-    // Handle actions
-    const actionLower = (aiResponse.action || '').toLowerCase();
+      // Emoji reaction
+      try { await bot.setMessageReaction(msg.chat.id, msg.message_id, { reaction: [{ type: 'emoji', emoji: '😁' }] }); } catch {}
+
+      // Handle actions
+      const actionLower = (aiResponse.action || '').toLowerCase();
     
     if (actionLower === 'register_wallet' || (aiResponse.action === 'chat' && msg.text.toLowerCase().includes('register'))) {
       const addressMatch = msg.text.match(/0x[a-fA-F0-9]{40}/);
@@ -996,22 +1277,42 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
 
       try {
         const giftId = ethers.id(code);
-        const gift = await contract.getGift(giftId);
+        
+        // Check if gift exists and is claimable with retry
+        const gift = await retryBlockchainCall(async () => {
+          return await contract.getGift(giftId);
+        });
         
         // Check if gift exists
         if (gift.gifter === ethers.ZeroAddress && !gift.deposited) {
-          await bot.sendMessage(msg.chat.id, "Gift not found. Make sure the code is correct.", { reply_to_message_id: msg.message_id });
+          await bot.sendMessage(msg.chat.id, "🤔 Gift not found. Double-check that code - maybe a typo? 😉", { reply_to_message_id: msg.message_id });
           return;
         }
 
+        // Check if already claimed FIRST
         if (gift.claimed) {
-          await bot.sendMessage(msg.chat.id, "This gift has already been claimed.", { reply_to_message_id: msg.message_id });
+          await bot.sendMessage(msg.chat.id, "🎁 This gift has already been claimed! Someone beat you to it. 😅", { reply_to_message_id: msg.message_id });
           return;
         }
 
         if (!gift.deposited) {
-          await bot.sendMessage(msg.chat.id, "Gift not deposited yet. Wait for the gifter to deposit.", { reply_to_message_id: msg.message_id });
+          await bot.sendMessage(msg.chat.id, "⏳ Gift not deposited yet. Wait for the gifter to deposit the funds first! 😉", { reply_to_message_id: msg.message_id });
           return;
+        }
+
+        // Check if locked out (claimDeadline > 0 and current block time < claimDeadline)
+        if (gift.claimDeadline > 0n) {
+          const currentBlockTime = await retryBlockchainCall(async () => {
+            const block = await provider.getBlock('latest');
+            return BigInt(block.timestamp);
+          });
+          
+          if (currentBlockTime < gift.claimDeadline) {
+            const lockoutSeconds = Number(gift.claimDeadline - currentBlockTime);
+            const lockoutMinutes = Math.ceil(lockoutSeconds / 60);
+            await bot.sendMessage(msg.chat.id, `🔒 You're locked out from wrong answers! Wait ${lockoutMinutes} more minute${lockoutMinutes !== 1 ? 's' : ''} before trying again. 😉`, { reply_to_message_id: msg.message_id });
+            return;
+          }
         }
 
         // Fetch Q&A from IPFS
@@ -1034,103 +1335,17 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
           recipientWallet: user.wallet_address
         });
 
-        await bot.sendMessage(msg.chat.id, question, { reply_to_message_id: msg.message_id });
+        // Friendly claim prompt
+        await bot.sendMessage(msg.chat.id, `Alright mate! 😉 To claim this gift, you'll need to answer a question (or riddle if you want to call it that). Here we go:\n\n**${question}**`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
       } catch (error) {
         console.error('Contract fetch error:', error);
-        await bot.sendMessage(msg.chat.id, "Error fetching gift details. Try again.", { reply_to_message_id: msg.message_id });
-      }
-      return;
-    }
-
-    // Handle claim answer
-    if (currentContext && currentContext.context_type === CONTEXT_TYPES.CLAIM_GIFT) {
-      const userAnswer = msg.text;
-      const claimData = currentContext.context_data;
-      
-      const expectedAnswers = claimData.expectedAnswers || [claimData.expectedAnswer].filter(Boolean);
-      let judgment = { correct: false, reason: "No match" };
-      
-      for (const expected of expectedAnswers) {
-        const testJudgment = await judgeAnswer(userAnswer, expected);
-        if (testJudgment.correct) {
-          judgment = testJudgment;
-          break;
-        }
-      }
-      
-      if (judgment.correct) {
-        let recipientWallet = claimData.recipientWallet;
-        if (!recipientWallet) {
-          const { data: giftRecord } = await supabase
-            .from('deeza_gifts')
-            .select('recipient_wallet')
-            .eq('code', claimData.code)
-            .single();
-          recipientWallet = giftRecord?.recipient_wallet || user.wallet_address;
-        }
-
-        if (!recipientWallet) {
-          await clearContext(tgId);
-          await bot.sendMessage(msg.chat.id, `⚠️ Error: Recipient wallet not found. Contact support.`, { reply_to_message_id: msg.message_id });
-          return;
-        }
-
-        if (user.wallet_address && recipientWallet.toLowerCase() !== user.wallet_address.toLowerCase()) {
-          await bot.sendMessage(msg.chat.id, `⚠️ This gift is for a different wallet address. You're claiming from ${user.wallet_address.substring(0, 10)}... but gift is for ${recipientWallet.substring(0, 10)}...`, { reply_to_message_id: msg.message_id });
-          await clearContext(tgId);
-          return;
-        }
-
-        if (contract) {
-          try {
-            const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
-            const contractWithSigner = contract.connect(botWallet);
-            
-            console.log(`[CLAIM] Releasing gift ${claimData.code}`);
-            const tx = await contractWithSigner.release(claimData.giftId);
-            await tx.wait();
-            console.log(`[CLAIM] ✅ Gift released! Tx: ${tx.hash}`);
-            
-            await clearContext(tgId);
-            await bot.sendMessage(msg.chat.id, `✅ Correct! Gift claimed successfully! 🎉\n\nTx: ${tx.hash}`, { reply_to_message_id: msg.message_id });
-          } catch (error) {
-            console.error('Release error:', error);
-            await bot.sendMessage(msg.chat.id, `Error releasing gift: ${error.message}`, { reply_to_message_id: msg.message_id });
-          }
-        } else {
-          await clearContext(tgId);
-          await bot.sendMessage(msg.chat.id, `✅ Correct! (Contract not deployed yet)`, { reply_to_message_id: msg.message_id });
-        }
-      } else {
-        let attempts = (claimData.attempts || 0) + 1;
-        
-        if (attempts >= 3) {
-          if (contract) {
-            try {
-              const botWallet = new ethers.Wallet(process.env.BOT_PRIVATE_KEY, provider);
-              const contractWithSigner = contract.connect(botWallet);
-              await contractWithSigner.extendClaimTime(claimData.giftId, 30);
-            } catch (e) {
-              console.error('Extend error:', e);
-            }
-          }
-          
-          await clearContext(tgId);
-          await bot.sendMessage(msg.chat.id, `❌ Wrong. Locked for 30 minutes. Try again later.`, { reply_to_message_id: msg.message_id });
-        } else {
-          await saveContext(tgId, CONTEXT_TYPES.CLAIM_GIFT, {
-            ...claimData,
-            attempts
-          });
-          
-          await bot.sendMessage(msg.chat.id, `❌ Wrong. Try again. (${3 - attempts} attempts left)`, { reply_to_message_id: msg.message_id });
-        }
+        await bot.sendMessage(msg.chat.id, "😕 Error fetching gift details. The network might be slow - try again in a moment! 😉", { reply_to_message_id: msg.message_id });
       }
       return;
     }
 
     // Send AI message only for chat action
-    if (aiResponse.action === 'chat' && aiResponse.message) {
+    if (aiResponse && aiResponse.action === 'chat' && aiResponse.message) {
       await bot.sendMessage(msg.chat.id, aiResponse.message, { disable_web_page_preview: true, reply_to_message_id: msg.message_id });
     }
 
