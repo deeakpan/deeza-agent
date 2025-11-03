@@ -133,7 +133,7 @@ async function saveContext(tgId, type, data) {
 }
 
 // Retry helper for blockchain calls
-async function retryBlockchainCall(fn, maxAttempts = 3, delayMs = 2000) {
+async function retryBlockchainCall(fn, maxAttempts = 3, delayMs = 3000) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -1047,16 +1047,32 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
               return;
             }
             
+            // Use 4 attempts for release (more critical operation)
             const tx = await retryBlockchainCall(async () => {
               const tx = await contractWithSigner.release(claimData.giftId);
               await tx.wait();
               return tx;
-            });
+            }, 4, 3000);
             
             console.log(`[CLAIM] ✅ Gift released! Tx: ${tx.hash}`);
             
+            // Get gift details for display
+            const giftDetails = await retryBlockchainCall(async () => {
+              return await contract.getGift(claimData.giftId);
+            });
+            
+            // Format amount and token name
+            const amount = ethers.formatEther(giftDetails.amount);
+            const isNative = giftDetails.token === ethers.ZeroAddress;
+            const tokenName = isNative ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
+            
+            // Build explorer link
+            const explorerUrl = IS_TESTNET 
+              ? `https://shannon-explorer.somnia.network/tx/${tx.hash}`
+              : `https://explorer.somnia.network/tx/${tx.hash}`;
+            
             await clearContext(tgId);
-            await bot.sendMessage(msg.chat.id, `🎉 **BOOM! Correct answer!** Gift claimed successfully! 🚀\n\nTx: ${tx.hash}`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+            await bot.sendMessage(msg.chat.id, `🎉 **BOOM! Correct answer!** Gift claimed successfully! 🚀\n\n💰 **You received:** ${amount} ${tokenName}\n\n🔗 [View Transaction](${explorerUrl})`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
           } catch (error) {
             console.error('Release error:', error);
             
@@ -1336,10 +1352,152 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
         });
 
         // Friendly claim prompt
-        await bot.sendMessage(msg.chat.id, `Alright mate! 😉 To claim this gift, you'll need to answer a question (or riddle if you want to call it that). Here we go:\n\n**${question}**`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+        await bot.sendMessage(msg.chat.id, `Alright mate! 😉 To claim this gift, you'll need to answer a question. Here we go:\n\n**${question}**`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
       } catch (error) {
         console.error('Contract fetch error:', error);
         await bot.sendMessage(msg.chat.id, "😕 Error fetching gift details. The network might be slow - try again in a moment! 😉", { reply_to_message_id: msg.message_id });
+      }
+      return;
+    }
+
+    if (aiResponse.action === 'show_gifts') {
+      if (!user.wallet_address) {
+        await bot.sendMessage(msg.chat.id, "⚠️ You need to register your wallet first!\n\nSay \"register me\" and provide your wallet address. 😉", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      if (!contract) {
+        await bot.sendMessage(msg.chat.id, "⚠️ Contract not deployed yet!", { reply_to_message_id: msg.message_id });
+        return;
+      }
+
+      const giftType = aiResponse.params?.type || 'all';
+      const userAddress = user.wallet_address.toLowerCase();
+
+      try {
+        // Query events from contract (all events, then filter by user address)
+        const filterCreated = contract.filters.GiftCreated();
+        const filterDeposited = contract.filters.GiftDeposited();
+        const filterClaimed = contract.filters.GiftClaimed();
+
+        // Get all events (from a reasonable block range, e.g., last 100k blocks)
+        const currentBlock = await retryBlockchainCall(async () => {
+          return await provider.getBlockNumber();
+        });
+        const fromBlock = Math.max(0, currentBlock - 100000);
+
+        const [createdEvents, depositedEvents, claimedEvents] = await Promise.all([
+          retryBlockchainCall(async () => contract.queryFilter(filterCreated, fromBlock)),
+          retryBlockchainCall(async () => contract.queryFilter(filterDeposited, fromBlock)),
+          retryBlockchainCall(async () => contract.queryFilter(filterClaimed, fromBlock))
+        ]);
+
+        // Process gifts sent (where user is gifter from deposited events)
+        const sentGifts = [];
+        for (const event of depositedEvents) {
+          try {
+            const gift = await retryBlockchainCall(async () => {
+              return await contract.getGift(event.args[0]);
+            });
+            if (gift.gifter?.toLowerCase() === userAddress) {
+              sentGifts.push({
+                code: gift.code,
+                recipient: gift.recipient,
+                token: gift.token,
+                amount: gift.amount,
+                deposited: gift.deposited,
+                claimed: gift.claimed
+              });
+            }
+          } catch (e) {
+            console.error('Error fetching sent gift:', e);
+          }
+        }
+
+        // Process gifts received (from created events where user is recipient)
+        // Note: recipient is args[1] in GiftCreated event but not indexed, so we check in code
+        const receivedGifts = [];
+        for (const event of createdEvents) {
+          try {
+            const gift = await retryBlockchainCall(async () => {
+              return await contract.getGift(event.args[0]);
+            });
+            if (gift.recipient?.toLowerCase() === userAddress) {
+              receivedGifts.push({
+                code: gift.code,
+                gifter: gift.gifter,
+                token: gift.token,
+                amount: gift.amount,
+                deposited: gift.deposited,
+                claimed: gift.claimed
+              });
+            }
+          } catch (e) {
+            console.error('Error fetching received gift:', e);
+          }
+        }
+
+        // Format response based on type
+        let response = '';
+        const explorerBase = IS_TESTNET ? 'https://shannon-explorer.somnia.network' : 'https://explorer.somnia.network';
+
+        if (giftType === 'sent' || giftType === 'all') {
+          if (sentGifts.length === 0) {
+            response += `📤 **Gifts Sent:** None yet 😔\n\n`;
+          } else {
+            response += `📤 **Gifts Sent:** ${sentGifts.length}\n`;
+            sentGifts.forEach((g, i) => {
+              const amount = ethers.formatEther(g.amount);
+              const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
+              const status = g.claimed ? '✅ Claimed' : (g.deposited ? '⏳ Pending' : '❌ Not Deposited');
+              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName} - ${status}\n`;
+            });
+            response += '\n';
+          }
+        }
+
+        if (giftType === 'pending' || giftType === 'active') {
+          const pendingGifts = receivedGifts.filter(g => g.deposited && !g.claimed);
+          if (pendingGifts.length === 0) {
+            response += `⏳ **Pending Gifts:** None 😔\n\n`;
+          } else {
+            response += `⏳ **Pending Gifts:** ${pendingGifts.length}\n`;
+            pendingGifts.forEach((g, i) => {
+              const amount = ethers.formatEther(g.amount);
+              const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
+              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName}\n`;
+              response += `   Say "claim ${g.code}" to claim it! 😉\n`;
+            });
+            response += '\n';
+          }
+        }
+
+        if (giftType === 'received' || giftType === 'all') {
+          if (receivedGifts.length === 0) {
+            response += `📥 **Gifts Received:** None yet 😔\n\n`;
+          } else {
+            const claimedCount = receivedGifts.filter(g => g.claimed).length;
+            response += `📥 **Gifts Received:** ${receivedGifts.length} (${claimedCount} claimed)\n`;
+            receivedGifts.slice(0, 10).forEach((g, i) => {
+              const amount = ethers.formatEther(g.amount);
+              const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
+              const status = g.claimed ? '✅ Claimed' : (g.deposited ? '⏳ Pending' : '❌ Not Deposited');
+              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName} - ${status}\n`;
+            });
+            if (receivedGifts.length > 10) {
+              response += `... and ${receivedGifts.length - 10} more\n`;
+            }
+          }
+        }
+
+        if (!response) {
+          response = 'No gifts found matching your query. Try sending or receiving some gifts! 😉';
+        }
+
+        await bot.sendMessage(msg.chat.id, response, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+      } catch (error) {
+        console.error('Show gifts error:', error);
+        await bot.sendMessage(msg.chat.id, `😕 Error fetching gifts. The network might be slow - try again in a moment! 😉`, { reply_to_message_id: msg.message_id });
       }
       return;
     }
