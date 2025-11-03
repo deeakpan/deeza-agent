@@ -793,10 +793,22 @@ Return ONLY JSON:
       }
       
       const testnetNote = IS_TESTNET ? '\n\n🧪 Testnet: All ERC20 tokens use ZAZZ mock token' : '';
-      const messageNote = message ? `\n💬 <b>Message:</b> ${message.replace(/</g, '&lt;').replace(/>/g, '&gt;')}` : '';
+      // Escape HTML special characters in the message
+      const escapedMessage = message ? message
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;') : '';
+      const messageNote = message ? `\n💬 <b>Message:</b> ${escapedMessage}` : '';
       
       // Escape HTML special characters in the question
-      const escapedQuestion = giftData.question.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;');
+      const escapedQuestion = giftData.question
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
       
       const confirmationMsg = `🎁 <b>Gift Summary</b>
 
@@ -951,19 +963,22 @@ Be flexible - understand natural language variations.`;
         
         const displayTokenName = giftData.token.toUpperCase() === 'SOMI' || giftData.token.toUpperCase() === 'STT' ? NATIVE_TOKEN : giftData.token.toUpperCase();
         
-        await bot.sendMessage(msg.chat.id, `✅ **Gift Created Successfully!**
+        const tokenDisplay = giftData.tokenAddress === ethers.ZeroAddress ? 'NATIVE token (STT/SOMI)' : giftData.tokenAddress;
+        const depositUrl = `${WALLET_CONNECT_URL}/deposit`;
+        
+        await bot.sendMessage(msg.chat.id, `✅ <b>Gift Created Successfully!</b>
 
-📦 **Deposit your ${displayTokenName} here:**
-${WALLET_CONNECT_URL}/deposit
+📦 <b>Deposit your ${displayTokenName} here:</b>
+${depositUrl}
 
-🎁 **Gift Code:** \`${giftData.code}\`
-💰 **Amount:** ${giftData.amount} ${displayTokenName}
-👤 **Recipient:** @${giftData.recipient}
-📍 **Token:** ${giftData.tokenAddress === ethers.ZeroAddress ? 'NATIVE token (STT/SOMI)' : giftData.tokenAddress}
+🎁 <b>Gift Code:</b> <code>${giftData.code}</code>
+💰 <b>Amount:</b> ${giftData.amount} ${displayTokenName}
+👤 <b>Recipient:</b> @${giftData.recipient}
+📍 <b>Token:</b> ${tokenDisplay}
 
 ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '⚠️ Recipient is not registered - share the code with them!'}
 
-**Next Step:** Paste your code on the deposit page to send the funds!`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+<b>Next Step:</b> Paste your code on the deposit page to send the funds!`, { reply_to_message_id: msg.message_id, parse_mode: 'HTML' });
         return;
       } else {
         await bot.sendMessage(msg.chat.id, "I didn't catch that. Say **'yes'** to create the gift or **'no'** to cancel. 😉", { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
