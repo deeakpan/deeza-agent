@@ -58,6 +58,10 @@ const CONTRACT_ABI = [
   'function release(bytes32 id) external',
   'function extendClaimTime(bytes32 id, uint256 minutes) external',
   'function getGift(bytes32 id) external view returns (tuple(address gifter, address recipient, address token, uint256 amount, string code, string ipfsLink, address claimer, uint256 claimDeadline, uint8 attempts, bool deposited, bool claimed))',
+  'function getGiftsByGifter(address gifter) external view returns (tuple(address gifter, address recipient, address token, uint256 amount, string code, string ipfsLink, address claimer, uint256 claimDeadline, uint8 attempts, bool deposited, bool claimed)[])',
+  'function getGiftsByRecipient(address recipient) external view returns (tuple(address gifter, address recipient, address token, uint256 amount, string code, string ipfsLink, address claimer, uint256 claimDeadline, uint8 attempts, bool deposited, bool claimed)[])',
+  'function getGiftCountByGifter(address gifter) external view returns (uint256)',
+  'function getGiftCountByRecipient(address recipient) external view returns (uint256)',
   'event GiftCreated(bytes32 indexed id, address recipient, address token, uint256 amount, string code)',
   'event GiftDeposited(bytes32 indexed id, address gifter)',
   'event GiftClaimed(bytes32 indexed id, address claimer, uint256 amount, address token)'
