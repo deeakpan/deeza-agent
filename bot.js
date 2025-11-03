@@ -1461,70 +1461,38 @@ Return ONLY the enhanced message, nothing else. Keep it natural and authentic.`;
       }
 
       const giftType = aiResponse.params?.type || 'all';
-      const userAddress = user.wallet_address.toLowerCase();
+      const userAddress = user.wallet_address;
 
       try {
-        // Query events from contract (all events, then filter by user address)
-        const filterCreated = contract.filters.GiftCreated();
-        const filterDeposited = contract.filters.GiftDeposited();
-        const filterClaimed = contract.filters.GiftClaimed();
-
-        // Get all events (from a reasonable block range, e.g., last 100k blocks)
-        const currentBlock = await retryBlockchainCall(async () => {
-          return await provider.getBlockNumber();
-        });
-        const fromBlock = Math.max(0, currentBlock - 100000);
-
-        const [createdEvents, depositedEvents, claimedEvents] = await Promise.all([
-          retryBlockchainCall(async () => contract.queryFilter(filterCreated, fromBlock)),
-          retryBlockchainCall(async () => contract.queryFilter(filterDeposited, fromBlock)),
-          retryBlockchainCall(async () => contract.queryFilter(filterClaimed, fromBlock))
+        // Use new contract functions to query gifts by address (no event queries needed!)
+        const [sentGiftsData, receivedGiftsData] = await Promise.all([
+          retryBlockchainCall(async () => {
+            return await contract.getGiftsByGifter(userAddress);
+          }),
+          retryBlockchainCall(async () => {
+            return await contract.getGiftsByRecipient(userAddress);
+          })
         ]);
 
-        // Process gifts sent (where user is gifter from deposited events)
-        const sentGifts = [];
-        for (const event of depositedEvents) {
-          try {
-            const gift = await retryBlockchainCall(async () => {
-              return await contract.getGift(event.args[0]);
-            });
-            if (gift.gifter?.toLowerCase() === userAddress) {
-              sentGifts.push({
-                code: gift.code,
-                recipient: gift.recipient,
-                token: gift.token,
-                amount: gift.amount,
-                deposited: gift.deposited,
-                claimed: gift.claimed
-              });
-            }
-          } catch (e) {
-            console.error('Error fetching sent gift:', e);
-          }
-        }
+        // Process gifts sent (where user is gifter)
+        const sentGifts = sentGiftsData.map(gift => ({
+          code: gift.code,
+          recipient: gift.recipient,
+          token: gift.token,
+          amount: gift.amount,
+          deposited: gift.deposited,
+          claimed: gift.claimed
+        }));
 
-        // Process gifts received (from created events where user is recipient)
-        // Note: recipient is args[1] in GiftCreated event but not indexed, so we check in code
-        const receivedGifts = [];
-        for (const event of createdEvents) {
-          try {
-            const gift = await retryBlockchainCall(async () => {
-              return await contract.getGift(event.args[0]);
-            });
-            if (gift.recipient?.toLowerCase() === userAddress) {
-              receivedGifts.push({
-                code: gift.code,
-                gifter: gift.gifter,
-                token: gift.token,
-                amount: gift.amount,
-                deposited: gift.deposited,
-                claimed: gift.claimed
-              });
-            }
-          } catch (e) {
-            console.error('Error fetching received gift:', e);
-          }
-        }
+        // Process gifts received (where user is recipient)
+        const receivedGifts = receivedGiftsData.map(gift => ({
+          code: gift.code,
+          gifter: gift.gifter,
+          token: gift.token,
+          amount: gift.amount,
+          deposited: gift.deposited,
+          claimed: gift.claimed
+        }));
 
         // Format response based on type
         let response = '';

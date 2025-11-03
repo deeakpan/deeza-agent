@@ -25,7 +25,7 @@ async function deployDeezaAgent() {
   }
 
   const contractArtifact = JSON.parse(fs.readFileSync(contractPath, 'utf8'));
-  const provider = new ethers.JsonRpcProvider(RPC_URL, { chainId: CHAIN_ID, name: 'somnia' });
+  const provider = new ethers.JsonRpcProvider(RPC_URL, { chainId: CHAIN_ID, name: 'somnia', staticNetwork: true });
   const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
   
   // Bot wallet is also the deployer/owner
@@ -49,13 +49,31 @@ async function deployDeezaAgent() {
     console.warn('⚠️  Wallet has 0 balance. Fund it before deploying!');
   }
 
-  // Deploy
+  // Deploy with retry logic
   const factory = new ethers.ContractFactory(contractArtifact.abi, contractArtifact.bytecode, wallet);
   console.log('Deploying contract...');
   
-  // Constructor takes bot address (same as deployer)
-  const contract = await factory.deploy(botAddress);
-  await contract.waitForDeployment();
+  let contract;
+  let attempts = 0;
+  const maxAttempts = 3;
+  
+  while (attempts < maxAttempts) {
+    try {
+      attempts++;
+      console.log(`Deployment attempt ${attempts}/${maxAttempts}...`);
+      
+      // Constructor takes bot address (same as deployer)
+      contract = await factory.deploy(botAddress);
+      await contract.waitForDeployment();
+      break;
+    } catch (error) {
+      if (attempts >= maxAttempts) {
+        throw error;
+      }
+      console.log(`Attempt ${attempts} failed: ${error.message}. Retrying in 3 seconds...`);
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+  }
   
   const address = await contract.getAddress();
   

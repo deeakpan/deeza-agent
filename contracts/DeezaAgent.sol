@@ -23,6 +23,10 @@ contract DeezaAgent is Ownable {
     }
 
     mapping(bytes32 => Gift) public gifts;
+    
+    // Indexes to query gifts by address
+    mapping(address => bytes32[]) public giftsByGifter;
+    mapping(address => bytes32[]) public giftsByRecipient;
 
     event GiftCreated(bytes32 indexed id, address recipient, address token, uint256 amount, string code);
     event GiftDeposited(bytes32 indexed id, address gifter);
@@ -69,6 +73,9 @@ contract DeezaAgent is Ownable {
             claimed: false
         });
 
+        // Index by recipient
+        giftsByRecipient[recipient].push(id);
+
         emit GiftCreated(id, recipient, token, amount, code);
     }
 
@@ -91,6 +98,9 @@ contract DeezaAgent is Ownable {
         g.deposited = true;
         // claimDeadline remains 0 = no lockout (claimable immediately)
         // Only set claimDeadline (lockout period) when wrong answers occur (via extendClaimTime)
+
+        // Index by gifter
+        giftsByGifter[msg.sender].push(id);
 
         emit GiftDeposited(id, msg.sender);
     }
@@ -131,6 +141,36 @@ contract DeezaAgent is Ownable {
     // Get gift info
     function getGift(bytes32 id) external view returns (Gift memory) {
         return gifts[id];
+    }
+
+    // Get all gifts where user is the gifter (depositor)
+    function getGiftsByGifter(address gifter) external view returns (Gift[] memory) {
+        bytes32[] memory giftIds = giftsByGifter[gifter];
+        Gift[] memory result = new Gift[](giftIds.length);
+        for (uint256 i = 0; i < giftIds.length; i++) {
+            result[i] = gifts[giftIds[i]];
+        }
+        return result;
+    }
+
+    // Get all gifts where user is the recipient
+    function getGiftsByRecipient(address recipient) external view returns (Gift[] memory) {
+        bytes32[] memory giftIds = giftsByRecipient[recipient];
+        Gift[] memory result = new Gift[](giftIds.length);
+        for (uint256 i = 0; i < giftIds.length; i++) {
+            result[i] = gifts[giftIds[i]];
+        }
+        return result;
+    }
+
+    // Get count of gifts by gifter (useful for pagination)
+    function getGiftCountByGifter(address gifter) external view returns (uint256) {
+        return giftsByGifter[gifter].length;
+    }
+
+    // Get count of gifts by recipient (useful for pagination)
+    function getGiftCountByRecipient(address recipient) external view returns (uint256) {
+        return giftsByRecipient[recipient].length;
     }
 
     // Emergency withdraw (owner only)
