@@ -87,6 +87,7 @@ const CONTEXT_TYPES = {
   REGISTER_WALLET_CONFIRM: 'register_wallet_confirm',
   SEND_GIFT_PROOF: 'send_gift_proof',
   SEND_GIFT_PROOF_CONFIRM: 'send_gift_proof_confirm', // NEW: Ask if they want to add more proofs
+  SEND_GIFT_MESSAGE: 'send_gift_message', // NEW: Collect optional message
   SEND_GIFT_CODE: 'send_gift_code',
   SEND_GIFT_CONFIRM: 'send_gift_confirm',
   CLAIM_GIFT: 'claim_gift'
@@ -500,6 +501,7 @@ bot.onText(/\/cancel/, async (msg) => {
         [CONTEXT_TYPES.REGISTER_WALLET_CONFIRM]: 'wallet update confirmation',
         [CONTEXT_TYPES.SEND_GIFT_PROOF]: 'gift creation (proof setup)',
         [CONTEXT_TYPES.SEND_GIFT_PROOF_CONFIRM]: 'gift creation (proof confirmation)',
+        [CONTEXT_TYPES.SEND_GIFT_MESSAGE]: 'gift creation (message)',
         [CONTEXT_TYPES.SEND_GIFT_CODE]: 'gift creation (custom code)',
         [CONTEXT_TYPES.SEND_GIFT_CONFIRM]: 'gift creation (final confirmation)',
         [CONTEXT_TYPES.CLAIM_GIFT]: 'gift claim'
@@ -543,6 +545,7 @@ bot.on('message', async (msg) => {
           [CONTEXT_TYPES.REGISTER_WALLET_CONFIRM]: 'wallet update confirmation',
           [CONTEXT_TYPES.SEND_GIFT_PROOF]: 'gift creation (proof setup)',
           [CONTEXT_TYPES.SEND_GIFT_PROOF_CONFIRM]: 'gift creation (proof confirmation)',
+          [CONTEXT_TYPES.SEND_GIFT_MESSAGE]: 'gift creation (message)',
           [CONTEXT_TYPES.SEND_GIFT_CODE]: 'gift creation (custom code)',
           [CONTEXT_TYPES.SEND_GIFT_CONFIRM]: 'gift creation (final confirmation)',
           [CONTEXT_TYPES.CLAIM_GIFT]: 'gift claim'
@@ -714,40 +717,63 @@ Return ONLY JSON:
         console.error('[GIFT_PROOF] AI error:', error);
       }
       
-      // Upload Q&A to IPFS
+      // Store proof data temporarily (will add message later before uploading to IPFS)
+      const giftId = ethers.id(code);
+      const giftIdHex = ethers.hexlify(giftId);
+
+      // Move to message collection (optional)
+      console.log(`[GIFT_PROOF] Saving context as SEND_GIFT_MESSAGE...`);
+      await saveContext(tgId, CONTEXT_TYPES.SEND_GIFT_MESSAGE, {
+        ...giftData,
+        code,
+        giftId: giftIdHex,
+        question,
+        expectedAnswer,
+        proofs: proofs
+      });
+      console.log(`[GIFT_PROOF] Context saved successfully as SEND_GIFT_MESSAGE`);
+
+      // Ask if they want to add a message
+      await bot.sendMessage(msg.chat.id, `Great! 😉 Would you like to add a personal message to this gift? (optional)\n\nYou can say:\n• A message like "Happy birthday!" or "Thanks for everything"\n• Or just say "skip" or "no" to continue without a message`, { reply_to_message_id: msg.message_id });
+      return;
+    }
+
+    // Handle message collection (optional)
+    if (existingContext && existingContext.context_type === CONTEXT_TYPES.SEND_GIFT_MESSAGE) {
+      const messageText = msg.text.trim().toLowerCase();
+      const isSkip = messageText === 'skip' || messageText === 'no' || messageText === 'n' || messageText === 'none' || messageText === '';
+      
+      const giftData = existingContext.context_data;
+      const message = isSkip ? null : msg.text.trim();
+      
+      // Now upload everything to IPFS
       const ipfsData = {
-        question: question,
-        answer: expectedAnswer,
-        proofs: proofs,
+        question: giftData.question,
+        answer: giftData.expectedAnswer,
+        proofs: giftData.proofs,
         gifter: user.telegram_username,
-        recipient: giftData.recipient
+        recipient: giftData.recipient,
+        message: message || null
       };
       
-      console.log(`[GIFT_PROOF] Uploading to IPFS...`);
+      console.log(`[GIFT_MESSAGE] Uploading to IPFS with message: ${message ? 'yes' : 'no'}...`);
       let ipfsLink = '';
       try {
         ipfsLink = await uploadToIPFS(ipfsData);
-        console.log(`[GIFT_PROOF] IPFS upload success: ${ipfsLink}`);
+        console.log(`[GIFT_MESSAGE] IPFS upload success: ${ipfsLink}`);
       } catch (error) {
-        console.error('[GIFT_PROOF] IPFS upload error:', error);
-        await bot.sendMessage(msg.chat.id, `⚠️ Error uploading proof: ${error.message}`, { reply_to_message_id: msg.message_id });
+        console.error('[GIFT_MESSAGE] IPFS upload error:', error);
+        await bot.sendMessage(msg.chat.id, `⚠️ Error uploading gift data: ${error.message}`, { reply_to_message_id: msg.message_id });
         await clearContext(tgId);
         return;
       }
 
-      const giftId = ethers.id(code);
-      const giftIdHex = ethers.hexlify(giftId);
-
-      // Move to confirmation with all the info
-      console.log(`[GIFT_PROOF] Saving context as SEND_GIFT_CONFIRM...`);
+      // Move to confirmation
       await saveContext(tgId, CONTEXT_TYPES.SEND_GIFT_CONFIRM, {
         ...giftData,
-        code,
-        giftId: giftIdHex,
         ipfsLink,
-        proofs: proofs
+        message: message
       });
-      console.log(`[GIFT_PROOF] Context saved successfully as SEND_GIFT_CONFIRM`);
 
       // Build comprehensive confirmation message
       const displayTokenName = giftData.token.toUpperCase() === 'SOMI' || giftData.token.toUpperCase() === 'STT' ? NATIVE_TOKEN : giftData.token.toUpperCase();
@@ -767,13 +793,14 @@ Return ONLY JSON:
       }
       
       const testnetNote = IS_TESTNET ? '\n\n🧪 Testnet: All ERC20 tokens use ZAZZ mock token' : '';
+      const messageNote = message ? `\n💬 **Message:** ${message}` : '';
       
       const confirmationMsg = `🎁 **Gift Summary**
 
 **Recipient:** ${recipientInfo}
 **Amount:** ${giftData.amount} ${displayTokenName}
-**Proof Required:** ${question}
-**Gift Code:** \`${code}\`${testnetNote}
+**Proof Required:** ${giftData.question}
+**Gift Code:** \`${giftData.code}\`${messageNote}${testnetNote}
 
 Shall I create this gift? (yes/no)`;
       
@@ -929,7 +956,7 @@ ${WALLET_CONNECT_URL}/deposit
 🎁 **Gift Code:** \`${giftData.code}\`
 💰 **Amount:** ${giftData.amount} ${displayTokenName}
 👤 **Recipient:** @${giftData.recipient}
-📍 **Token Address:** ${giftData.tokenAddress === ethers.ZeroAddress ? 'Native (STT/SOMI)' : giftData.tokenAddress}
+📍 **Token:** ${giftData.tokenAddress === ethers.ZeroAddress ? 'NATIVE token (STT/SOMI)' : giftData.tokenAddress}
 
 ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '⚠️ Recipient is not registered - share the code with them!'}
 
@@ -1071,8 +1098,52 @@ ${recipient && recipient.telegram_id ? '✉️ Recipient has been notified!' : '
               ? `https://shannon-explorer.somnia.network/tx/${tx.hash}`
               : `https://explorer.somnia.network/tx/${tx.hash}`;
             
+            // Fetch message from IPFS and enhance with AI
+            let enhancedMessage = null;
+            try {
+              const ipfsData = await fetchFromIPFS(giftDetails.ipfsLink);
+              if (ipfsData.message && ipfsData.message.trim()) {
+                // Use AI to enhance the message
+                try {
+                  const enhancePrompt = `Enhance this gift message to make it more warm, personal, and heartfelt. Keep the original meaning but make it sound more special and memorable. Don't add quotes unless the original has quotes.
+
+Original message: "${ipfsData.message}"
+
+Return ONLY the enhanced message, nothing else. Keep it natural and authentic.`;
+                  
+                  const enhanceResponse = await openai.chat.completions.create({
+                    model: "gpt-4",
+                    messages: [
+                      { role: "system", content: "You enhance gift messages to be warmer and more heartfelt while keeping the original meaning. Return only the enhanced message." },
+                      { role: "user", content: enhancePrompt }
+                    ],
+                    temperature: 0.7,
+                    max_tokens: 150
+                  });
+                  
+                  enhancedMessage = enhanceResponse.choices[0].message.content.trim();
+                  // Remove quotes if AI wrapped it
+                  if (enhancedMessage.startsWith('"') && enhancedMessage.endsWith('"')) {
+                    enhancedMessage = enhancedMessage.slice(1, -1);
+                  }
+                } catch (aiError) {
+                  console.error('[MESSAGE_ENHANCE] AI error:', aiError);
+                  enhancedMessage = ipfsData.message; // Fallback to original
+                }
+              }
+            } catch (ipfsError) {
+              console.error('[MESSAGE_FETCH] Error fetching message:', ipfsError);
+            }
+            
+            // Build success message
+            let successMsg = `🎉 **BOOM! Correct answer!** Gift claimed successfully! 🚀\n\n💰 **You received:** ${amount} ${tokenName}\n\n🔗 [View Transaction](${explorerUrl})`;
+            
+            if (enhancedMessage) {
+              successMsg += `\n\n💬 **Message from the gifter:**\n"${enhancedMessage}"`;
+            }
+            
             await clearContext(tgId);
-            await bot.sendMessage(msg.chat.id, `🎉 **BOOM! Correct answer!** Gift claimed successfully! 🚀\n\n💰 **You received:** ${amount} ${tokenName}\n\n🔗 [View Transaction](${explorerUrl})`, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+            await bot.sendMessage(msg.chat.id, successMsg, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
           } catch (error) {
             console.error('Release error:', error);
             
