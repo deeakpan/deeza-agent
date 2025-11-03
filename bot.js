@@ -793,18 +793,21 @@ Return ONLY JSON:
       }
       
       const testnetNote = IS_TESTNET ? '\n\n🧪 Testnet: All ERC20 tokens use ZAZZ mock token' : '';
-      const messageNote = message ? `\n💬 **Message:** ${message}` : '';
+      const messageNote = message ? `\n💬 <b>Message:</b> ${message.replace(/</g, '&lt;').replace(/>/g, '&gt;')}` : '';
       
-      const confirmationMsg = `🎁 **Gift Summary**
+      // Escape HTML special characters in the question
+      const escapedQuestion = giftData.question.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/&/g, '&amp;');
+      
+      const confirmationMsg = `🎁 <b>Gift Summary</b>
 
-**Recipient:** ${recipientInfo}
-**Amount:** ${giftData.amount} ${displayTokenName}
-**Proof Required:** ${giftData.question}
-**Gift Code:** \`${giftData.code}\`${messageNote}${testnetNote}
+<b>Recipient:</b> ${recipientInfo.replace(/</g, '&lt;').replace(/>/g, '&gt;')}
+<b>Amount:</b> ${giftData.amount} ${displayTokenName}
+<b>Proof Required:</b> ${escapedQuestion}
+<b>Gift Code:</b> <code>${giftData.code}</code>${messageNote}${testnetNote}
 
 Shall I create this gift? (yes/no)`;
       
-      await bot.sendMessage(msg.chat.id, confirmationMsg, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+      await bot.sendMessage(msg.chat.id, confirmationMsg, { reply_to_message_id: msg.message_id, parse_mode: 'HTML' });
       return;
     }
 

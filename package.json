@@ -1,11 +1,11 @@
 {
   "name": "deeza-agent",
   "version": "1.0.0",
-  "main": "deezabot.js",
+  "main": "bot.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node deezabot.js",
-    "dev": "nodemon deezabot.js"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
   },
   "keywords": [],
   "author": "",
