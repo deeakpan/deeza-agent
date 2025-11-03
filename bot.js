@@ -26,7 +26,7 @@ const IS_TESTNET = process.env.IS_TESTNET === 'true' || process.env.NODE_ENV ===
 const SOMNIA_RPC = process.env.SOMNIA_RPC || (IS_TESTNET ? 'https://dream-rpc.somnia.network' : 'https://somnia.publicnode.com');
 const SOMNIA_CHAIN_ID = parseInt(process.env.SOMNIA_CHAIN_ID || (IS_TESTNET ? '50312' : '50311'));
 const CONTRACT_ADDRESS = process.env.DEEZA_AGENT_CONTRACT;
-const WALLET_CONNECT_URL = 'https://deeza.vercel.app';
+const WALLET_CONNECT_URL = 'https://deeza-website.vercel.app';
 
 // Testnet: ZAZZ token (mock token for all ERC20 requests)
 const ZAZZ_TOKEN_ADDRESS = process.env.ZAZZ_TOKEN_ADDRESS || ethers.ZeroAddress;
