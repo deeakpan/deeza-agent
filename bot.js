@@ -185,6 +185,17 @@ async function getUserByUsername(username) {
   return data;
 }
 
+async function getUserByWalletAddress(walletAddress) {
+  if (!walletAddress || walletAddress === ethers.ZeroAddress) return null;
+  const { data } = await supabase
+    .from('deeza_users')
+    .select('telegram_username, telegram_id')
+    .eq('wallet_address', walletAddress.toLowerCase())
+    .single();
+
+  return data || null;
+}
+
 // AI Intent Parser
 async function processWithAI(userMessage, existingContext = null) {
   try {
@@ -1478,75 +1489,103 @@ Return ONLY the enhanced message, nothing else. Keep it natural and authentic.`;
           })
         ]);
 
-        // Process gifts sent (where user is gifter)
-        const sentGifts = sentGiftsData.map(gift => ({
-          code: gift.code,
-          recipient: gift.recipient,
-          token: gift.token,
-          amount: gift.amount,
-          deposited: gift.deposited,
-          claimed: gift.claimed
-        }));
+        // Process gifts sent (where user is gifter) - look up recipient usernames
+        const sentGiftsWithRecipients = await Promise.all(
+          sentGiftsData.map(async (gift) => {
+            const recipientUser = await getUserByWalletAddress(gift.recipient);
+            const recipientName = recipientUser?.telegram_username 
+              ? `@${recipientUser.telegram_username}` 
+              : `${gift.recipient.substring(0, 8)}...${gift.recipient.substring(36)}`;
+            return {
+              code: gift.code,
+              recipient: gift.recipient,
+              recipientName,
+              token: gift.token,
+              amount: gift.amount,
+              deposited: gift.deposited,
+              claimed: gift.claimed
+            };
+          })
+        );
 
-        // Process gifts received (where user is recipient)
-        const receivedGifts = receivedGiftsData.map(gift => ({
-          code: gift.code,
-          gifter: gift.gifter,
-          token: gift.token,
-          amount: gift.amount,
-          deposited: gift.deposited,
-          claimed: gift.claimed
-        }));
+        // Process gifts received (where user is recipient) - look up gifter usernames
+        const receivedGiftsWithGifters = await Promise.all(
+          receivedGiftsData.map(async (gift) => {
+            const gifterUser = await getUserByWalletAddress(gift.gifter);
+            const gifterName = gifterUser?.telegram_username 
+              ? `@${gifterUser.telegram_username}` 
+              : (gift.gifter !== ethers.ZeroAddress ? `${gift.gifter.substring(0, 8)}...${gift.gifter.substring(36)}` : 'Unknown');
+            return {
+              code: gift.code,
+              gifter: gift.gifter,
+              gifterName,
+              token: gift.token,
+              amount: gift.amount,
+              deposited: gift.deposited,
+              claimed: gift.claimed
+            };
+          })
+        );
 
-        // Format response based on type
+        // Format response based on type - make it more conversational
         let response = '';
         const explorerBase = IS_TESTNET ? 'https://shannon-explorer.somnia.network' : 'https://explorer.somnia.network';
 
         if (giftType === 'sent' || giftType === 'all') {
-          if (sentGifts.length === 0) {
-            response += `📤 **Gifts Sent:** None yet 😔\n\n`;
+          if (sentGiftsWithRecipients.length === 0) {
+            response += `📤 You haven't sent any gifts yet! Ready to spread some crypto love? 😉\n\n`;
           } else {
-            response += `📤 **Gifts Sent:** ${sentGifts.length}\n`;
-            sentGifts.forEach((g, i) => {
+            const claimedCount = sentGiftsWithRecipients.filter(g => g.claimed).length;
+            response += `📤 You've sent ${sentGiftsWithRecipients.length} gift${sentGiftsWithRecipients.length > 1 ? 's' : ''}${claimedCount > 0 ? ` (${claimedCount} already claimed! 🎉)` : ''}\n\n`;
+            sentGiftsWithRecipients.forEach((g, i) => {
               const amount = ethers.formatEther(g.amount);
               const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
-              const status = g.claimed ? '✅ Claimed' : (g.deposited ? '⏳ Pending' : '❌ Not Deposited');
-              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName} - ${status}\n`;
+              if (g.claimed) {
+                response += `✅ You sent ${amount} ${tokenName} to ${g.recipientName} - they claimed it! 🎁\n`;
+              } else if (g.deposited) {
+                response += `⏳ You sent ${amount} ${tokenName} to ${g.recipientName} - waiting for them to claim it!\n`;
+              } else {
+                response += `💰 You created a gift of ${amount} ${tokenName} for ${g.recipientName} - code: <code>${g.code}</code> (not deposited yet)\n`;
+              }
             });
             response += '\n';
           }
         }
 
         if (giftType === 'pending' || giftType === 'active') {
-          const pendingGifts = receivedGifts.filter(g => g.deposited && !g.claimed);
+          const pendingGifts = receivedGiftsWithGifters.filter(g => g.deposited && !g.claimed);
           if (pendingGifts.length === 0) {
-            response += `⏳ **Pending Gifts:** None 😔\n\n`;
+            response += `⏳ No pending gifts right now. Check back later! 😉\n\n`;
           } else {
-            response += `⏳ **Pending Gifts:** ${pendingGifts.length}\n`;
+            response += `⏳ You have ${pendingGifts.length} gift${pendingGifts.length > 1 ? 's' : ''} waiting to be claimed! 🎁\n\n`;
             pendingGifts.forEach((g, i) => {
               const amount = ethers.formatEther(g.amount);
               const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
-              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName}\n`;
-              response += `   Say "claim ${g.code}" to claim it! 😉\n`;
+              response += `🎁 ${g.gifterName} sent you ${amount} ${tokenName}!\n`;
+              response += `   Code: <code>${g.code}</code> - Say "claim ${g.code}" to claim it! 😉\n\n`;
             });
-            response += '\n';
           }
         }
 
         if (giftType === 'received' || giftType === 'all') {
-          if (receivedGifts.length === 0) {
-            response += `📥 **Gifts Received:** None yet 😔\n\n`;
+          if (receivedGiftsWithGifters.length === 0) {
+            response += `📥 No gifts received yet. Share your username with friends to get some crypto gifts! 😉\n\n`;
           } else {
-            const claimedCount = receivedGifts.filter(g => g.claimed).length;
-            response += `📥 **Gifts Received:** ${receivedGifts.length} (${claimedCount} claimed)\n`;
-            receivedGifts.slice(0, 10).forEach((g, i) => {
+            const claimedCount = receivedGiftsWithGifters.filter(g => g.claimed).length;
+            response += `📥 You've received ${receivedGiftsWithGifters.length} gift${receivedGiftsWithGifters.length > 1 ? 's' : ''}${claimedCount > 0 ? ` (${claimedCount} claimed! 🎉)` : ''}\n\n`;
+            receivedGiftsWithGifters.slice(0, 10).forEach((g, i) => {
               const amount = ethers.formatEther(g.amount);
               const tokenName = g.token === ethers.ZeroAddress ? NATIVE_TOKEN : (IS_TESTNET ? 'ZAZZ' : 'TOKEN');
-              const status = g.claimed ? '✅ Claimed' : (g.deposited ? '⏳ Pending' : '❌ Not Deposited');
-              response += `${i + 1}. Code: \`${g.code}\` - ${amount} ${tokenName} - ${status}\n`;
+              if (g.claimed) {
+                response += `✅ You received ${amount} ${tokenName} from ${g.gifterName} - claimed! 🎉\n`;
+              } else if (g.deposited) {
+                response += `⏳ ${g.gifterName} sent you ${amount} ${tokenName} - code: <code>${g.code}</code> (ready to claim!)\n`;
+              } else {
+                response += `💰 ${g.gifterName} created a gift of ${amount} ${tokenName} for you - code: <code>${g.code}</code> (not deposited yet)\n`;
+              }
             });
-            if (receivedGifts.length > 10) {
-              response += `... and ${receivedGifts.length - 10} more\n`;
+            if (receivedGiftsWithGifters.length > 10) {
+              response += `\n... and ${receivedGiftsWithGifters.length - 10} more gift${receivedGiftsWithGifters.length - 10 > 1 ? 's' : ''}! 😉\n`;
             }
           }
         }
@@ -1555,7 +1594,7 @@ Return ONLY the enhanced message, nothing else. Keep it natural and authentic.`;
           response = 'No gifts found matching your query. Try sending or receiving some gifts! 😉';
         }
 
-        await bot.sendMessage(msg.chat.id, response, { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' });
+        await bot.sendMessage(msg.chat.id, response, { reply_to_message_id: msg.message_id, parse_mode: 'HTML' });
       } catch (error) {
         console.error('Show gifts error:', error);
         await bot.sendMessage(msg.chat.id, `😕 Error fetching gifts. The network might be slow - try again in a moment! 😉`, { reply_to_message_id: msg.message_id });
